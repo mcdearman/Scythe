@@ -1,0 +1,205 @@
+-- Regular expressions, as much of them as a lexer needs.
+--
+-- A pattern is read into a tree here and turned into a machine elsewhere. What
+-- is supported is what a token looks like: bytes, classes, the three
+-- repetitions, alternation and grouping. There are no captures, no
+-- backreferences and no anchors -- a lexer matches from where it stands and
+-- takes the longest match, so there is nothing for those to mean.
+--
+-- Bytes, not characters: a pattern is matched against the input's bytes, and a
+-- class of ASCII ranges means what it says. `.` is any byte but a newline.
+
+use Std.String as S
+use Std.Collections.Vector as V
+use Std.Maybe.Maybe.*
+use Std.Result.Result.*
+use Re.*
+
+@pub data Re
+  -- One byte, exactly this one.
+  = Lit Int
+  -- One byte from these ranges, or -- negated -- from none of them.
+  | Class Bool [(Int, Int)]
+  | Cat [Re]
+  | Alt [Re]
+  | Star Re
+  -- The empty string, which is what a pattern with nothing in it matches.
+  | Empty
+
+-- `pattern` as a tree, or what is wrong with it.
+@pub fun parse pattern =
+  let bytes = V.map toInt (V.fromArray (S.toBytes pattern)) in
+  match alternation bytes 0 with
+  | Err e -> Err e
+  | Ok (re, at) ->
+      if at == V.len bytes then Ok re
+      else Err "a `)` with no `(` before it"
+
+-- `a|b|c`
+fun alternation bytes at =
+  match sequence bytes at with
+  | Err e -> Err e
+  | Ok (first, next) -> alternationRest bytes next [first]
+
+fun alternationRest bytes at sofar =
+  if byteAt bytes at == 124 then
+    match sequence bytes (at + 1) with
+    | Err e -> Err e
+    | Ok (re, next) -> alternationRest bytes next (V.pushBack sofar re)
+  else if V.len sofar == 1 then Ok (V.getOr Empty sofar 0, at)
+  else Ok (Alt sofar, at)
+
+-- A run of repeated atoms, which ends at `|`, `)` or the end of the pattern.
+fun sequence bytes at = sequenceRest bytes at []
+
+fun sequenceRest bytes at sofar =
+  let b = byteAt bytes at in
+  if b == 0 - 1 or b == 124 or b == 41 then
+    if V.len sofar == 1 then Ok (V.getOr Empty sofar 0, at)
+    else if V.isEmpty sofar then Ok (Empty, at)
+    else Ok (Cat sofar, at)
+  else
+    match repeated bytes at with
+    | Err e -> Err e
+    | Ok (re, next) -> sequenceRest bytes next (V.pushBack sofar re)
+
+-- An atom and whatever `*`, `+` or `?` follows it.
+fun repeated bytes at =
+  match atom bytes at with
+  | Err e -> Err e
+  | Ok (re, next) -> Ok (suffixes bytes next re)
+
+fun suffixes bytes at re =
+  let b = byteAt bytes at in
+  if b == 42 then suffixes bytes (at + 1) (Star re)
+  -- `r+` is `r r*` and `r?` is `r` or nothing: both are written out here, so
+  -- that what comes after has three shapes to think about rather than five.
+  else if b == 43 then suffixes bytes (at + 1) (Cat [re, Star re])
+  else if b == 63 then suffixes bytes (at + 1) (Alt [re, Empty])
+  else (re, at)
+
+fun atom bytes at =
+  let b = byteAt bytes at in
+  if b == 0 - 1 then Err "a pattern that stops in the middle"
+  else if b == 40 then group bytes (at + 1)
+  else if b == 91 then charClass bytes (at + 1)
+  else if b == 46 then Ok (Class True [(10, 10)], at + 1)
+  else if b == 92 then escape bytes (at + 1)
+  else if b == 42 or b == 43 or b == 63 then Err "a repetition with nothing before it"
+  else Ok (Lit b, at + 1)
+
+fun group bytes at =
+  match alternation bytes at with
+  | Err e -> Err e
+  | Ok (re, next) ->
+      if byteAt bytes next == 41 then Ok (re, next + 1)
+      else Err "a `(` with no `)` after it"
+
+-- `[abc]`, `[a-z0-9_]`, `[^ \t]`
+fun charClass bytes at =
+  let negated = byteAt bytes at == 94 in
+  let from = if negated then at + 1 else at in
+  match classItems bytes from [] with
+  | Err e -> Err e
+  | Ok (ranges, next) ->
+      if V.isEmpty ranges then Err "a class with nothing in it"
+      else Ok (Class negated ranges, next)
+
+fun classItems bytes at sofar =
+  let b = byteAt bytes at in
+  if b == 0 - 1 then Err "a `[` with no `]` after it"
+  else if b == 93 then Ok (sofar, at + 1)
+  else
+    match classByte bytes at with
+    | Err e -> Err e
+    | Ok (lo, next) ->
+        -- `a-z`, but a `-` before the `]` is just a hyphen.
+        if byteAt bytes next == 45 and byteAt bytes (next + 1) != 93
+        and byteAt bytes (next + 1) != (0 - 1) then
+          match classByte bytes (next + 1) with
+          | Err e -> Err e
+          | Ok (hi, after) ->
+              if hi < lo then Err "a range that runs backwards"
+              else classItems bytes after (V.pushBack sofar (lo, hi))
+        else classItems bytes next (V.pushBack sofar (lo, lo))
+
+-- One byte inside a class, which may be escaped.
+fun classByte bytes at =
+  let b = byteAt bytes at in
+  if b != 92 then Ok (b, at + 1)
+  else
+    let e = byteAt bytes (at + 1) in
+    if e == 0 - 1 then Err "a `\\` at the end of a pattern"
+    else Ok (unescape e, at + 2)
+
+fun escape bytes at =
+  let b = byteAt bytes at in
+  if b == 0 - 1 then Err "a `\\` at the end of a pattern"
+  -- The classes that have a letter of their own.
+  else if b == 100 then Ok (Class False digits, at + 1)
+  else if b == 68 then Ok (Class True digits, at + 1)
+  else if b == 119 then Ok (Class False wordBytes, at + 1)
+  else if b == 87 then Ok (Class True wordBytes, at + 1)
+  else if b == 115 then Ok (Class False spaces, at + 1)
+  else if b == 83 then Ok (Class True spaces, at + 1)
+  else Ok (Lit (unescape b), at + 1)
+
+fun unescape b =
+  if b == 110 then 10
+  else if b == 116 then 9
+  else if b == 114 then 13
+  else if b == 48 then 0
+  else b
+
+@pub def digits = [(48, 57)]
+@pub def wordBytes = [(48, 57), (65, 90), (95, 95), (97, 122)]
+@pub def spaces = [(9, 10), (13, 13), (32, 32)]
+
+-- The byte at `i`, or -1 where there is none: a pattern is read by looking at
+-- one byte at a time, and "there is no byte" is a case every look has.
+fun byteAt bytes i = V.getOr (0 - 1) bytes i
+
+-- --- tests -------------------------------------------------------------------
+
+use Std.Test (assertEq, assertTrue)
+
+@test fun aLiteralIsItsBytes () =
+  assertEq (parse "ab") (Ok (Cat [Lit 97, Lit 98])) "two bytes"
+
+@test fun oneByteNeedsNoSequence () =
+  assertEq (parse "a") (Ok (Lit 97)) "one byte"
+
+@test fun repetitionsAreWrittenOut () =
+  let a = assertEq (parse "a*") (Ok (Star (Lit 97))) "star" in
+  let b = assertEq (parse "a+") (Ok (Cat [Lit 97, Star (Lit 97)])) "plus" in
+  assertEq (parse "a?") (Ok (Alt [Lit 97, Empty])) "option"
+
+@test fun alternationSplitsAtTheBar () =
+  assertEq (parse "a|b") (Ok (Alt [Lit 97, Lit 98])) "two branches"
+
+@test fun groupsNest () =
+  assertEq (parse "(ab)*") (Ok (Star (Cat [Lit 97, Lit 98]))) "a group under a star"
+
+@test fun classesAreRanges () =
+  let a = assertEq (parse "[a-z]") (Ok (Class False [(97, 122)])) "a range" in
+  let b = assertEq (parse "[abc]") (Ok (Class False [(97, 97), (98, 98), (99, 99)])) "bytes" in
+  let c = assertEq (parse "[^0-9]") (Ok (Class True [(48, 57)])) "negated" in
+  assertEq (parse "[a-]") (Ok (Class False [(97, 97), (45, 45)])) "a hyphen at the end"
+
+@test fun theShorthandClassesAreClasses () =
+  let a = assertEq (parse "\\d") (Ok (Class False digits)) "digits" in
+  let b = assertEq (parse "\\w") (Ok (Class False wordBytes)) "word bytes" in
+  assertEq (parse "\\s") (Ok (Class False spaces)) "spaces"
+
+@test fun anEscapedMetacharacterIsItself () =
+  let a = assertEq (parse "\\.") (Ok (Lit 46)) "a full stop" in
+  assertEq (parse "\\n") (Ok (Lit 10)) "a newline"
+
+@test fun whatIsNotAPatternIsReported () =
+  let a = assertTrue (isErr (parse "(a")) "an unclosed group" in
+  let b = assertTrue (isErr (parse "a)")) "a stray bracket" in
+  let c = assertTrue (isErr (parse "[a")) "an unclosed class" in
+  let d = assertTrue (isErr (parse "*")) "a repetition with nothing before it" in
+  assertTrue (isErr (parse "[z-a]")) "a backwards range"
+
+fun isErr r = match r with | Err _ -> True | Ok _ -> False

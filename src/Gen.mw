@@ -1,0 +1,278 @@
+-- `@derive(Lexer)`: reading a token declaration and writing its lexer.
+--
+-- This is the macro. It runs while the package that wrote the declaration is
+-- compiled, so everything expensive -- parsing the patterns, building the
+-- automaton -- happens once, there, and what is left for run time is a table
+-- walk.
+--
+-- What it reads is the declaration as written, attributes and all:
+--
+--     @derive(Lexer)
+--     @skip(" +")
+--     data Token
+--       = @token("+") Plus
+--       | @regex("[0-9]+") Number String
+--
+-- and what it writes beside it is `lexToken : String -> Result Error [Lexed Token]`.
+-- A variant with a `String` field is given the text that matched it; one with
+-- no fields is given nothing.
+
+use Std.Macro (TokenTree, spaced, text, isPunct, isWord, inside, splitOn, fail)
+use Std.Macro.TokenTree.*
+use Std.Macro.Delim.*
+use Std.Collections.Vector as V
+use Std.String as S
+use Std.Maybe.Maybe.*
+use Std.Result.Result.*
+use logos.Regex (parse)
+use logos.Automaton (compile, dfaMoves, dfaAccepts)
+
+@pub fun lexer ts =
+  match declaration ts with
+  | Err why -> fail why
+  | Ok (name, skips, variants) ->
+      match patterns variants skips with
+      | Err why -> fail why
+      | Ok res -> [Code (written name skips variants (compile res))]
+
+-- --- reading the declaration ---------------------------------------------------
+
+-- The type's name, the patterns to skip, and the variants as they were written.
+fun declaration ts =
+  match V.toList (V.drop (dropUntilData ts) 1) with
+  | Nil -> Err "there is no `data` here for a lexer to be made from"
+  | Cons nameTok rest ->
+      match word nameTok with
+      | None -> Err "a `data` declaration with no name"
+      | Just name ->
+          let body = V.dropWhile (\t -> not (isPunct "=" t)) (V.fromList rest) in
+          if V.isEmpty body then Err "a `data` declaration with no variants"
+          else Ok (name, skipsOf ts, splitOn "|" (V.drop body 1))
+
+fun dropUntilData ts = V.dropWhile (\t -> not (isWord "data" t)) ts
+
+fun word t = match t with | Word w -> Just w | _ -> None
+
+-- `@skip("…")` written above the declaration, in the order they appear.
+fun skipsOf ts =
+  let heading = V.takeWhile (\t -> not (isWord "data" t)) ts in
+  attributeArgs heading "skip"
+
+-- The text inside every `@name("…")` in `ts`.
+fun attributeArgs ts name =
+  V.foldl
+    (\acc i ->
+      if isWord name (V.getOr (Punct "") ts i) and isPunct "@" (V.getOr (Punct "") ts (i - 1)) then
+        match literalIn (V.getOr (Punct "") ts (i + 1)) with
+        | Just s -> V.pushBack acc s
+        | None -> acc
+      else acc)
+    []
+    (V.range 1 (V.len ts))
+
+-- The string inside `( "…" )`.
+fun literalIn t =
+  match inside t with
+  | None -> None
+  | Just ts ->
+      match V.toList ts with
+      | Cons (Str s) Nil -> Just s
+      | _ -> None
+
+-- --- the patterns, in the order the machine numbers them ----------------------
+
+-- Every variant's pattern, then every `@skip`: the skipped ones come last so
+-- that a token always beats whitespace when both could match.
+fun patterns variants skips =
+  match collect variants 0 [] with
+  | Err why -> Err why
+  | Ok res ->
+      collectSkips skips (V.len variants) res
+
+fun collect variants at sofar =
+  if at >= V.len variants then Ok sofar
+  else
+    let v = V.getOr [] variants at in
+    match patternOf v with
+    | Err why -> Err why
+    | Ok re -> collect variants (at + 1) (V.pushBack sofar (at, re))
+
+fun collectSkips skips base sofar =
+  V.foldl
+    (\acc pair ->
+      match acc with
+      | Err why -> Err why
+      | Ok res ->
+          match pair with
+          | (i, pattern) ->
+              match parse pattern with
+              | Err why -> Err "a `@skip` pattern that is not a pattern: ${why}"
+              | Ok re -> Ok (V.pushBack res (base + i, re)))
+    (Ok sofar)
+    (V.zip (V.range 0 (V.len skips)) skips)
+
+-- A variant's pattern: `@token("…")` is text to match exactly, `@regex("…")`
+-- is a pattern.
+fun patternOf v =
+  let literal = attributeArgs v "token" in
+  let pattern = attributeArgs v "regex" in
+  if not (V.isEmpty literal) then
+    match parse (quoted (V.getOr "" literal 0)) with
+    | Err why -> Err "a `@token` that cannot be matched: ${why}"
+    | Ok re -> Ok re
+  else if not (V.isEmpty pattern) then
+    match parse (V.getOr "" pattern 0) with
+    | Err why -> Err "a `@regex` that is not a pattern: ${why}"
+    | Ok re -> Ok re
+  else Err "`${ctorOf v}` says nothing about what it matches: give it a `@token` or a `@regex`"
+
+-- Text as a pattern that matches exactly it.
+fun quoted s =
+  V.foldl (\acc b -> acc ++ escaped b) "" (V.fromArray (S.toBytes s))
+
+fun escaped b =
+  let c = S.fromBytes #[b] in
+  if V.elem (toInt b) metaBytes then "\\${c}" else c
+
+def metaBytes = [40, 41, 91, 93, 123, 125, 46, 42, 43, 63, 124, 94, 36, 92, 45]
+
+-- --- writing the lexer ---------------------------------------------------------
+
+fun written name skips variants d =
+  let ids = V.range 0 (V.len variants) in
+  let skipIds = V.map (\i -> V.len variants + i) (V.range 0 (V.len skips)) in
+  "use logos (Dfa, scan)
+
+def ${lower name}Table = Dfa ${showMoves (dfaMoves d)} ${showInts (dfaAccepts d)}
+
+@pub fun lex${name} input =
+  scan ${lower name}Table ${showInts skipIds} (\\id text -> ${arms name variants ids}) input"
+
+-- `if id == 0 then Type.Plus else …`, and a token that takes the text is given
+-- it. The last arm needs no test: the table answers with nothing else.
+fun arms name variants ids =
+  match V.toList ids with
+  | Nil -> "${name}"
+  | Cons _ _ ->
+      V.foldl
+      (\acc i ->
+        let ctor = build name (V.getOr [] variants i) in
+        if i + 1 == V.len ids then "${acc}${ctor}"
+        else "${acc}if id == ${show i} then ${ctor} else ")
+      ""
+      ids
+
+fun build name v =
+  let ctor = ctorOf v in
+  if takesText v then "(${name}.${ctor} text)" else "${name}.${ctor}"
+
+-- The variant's name: the first word that is not an attribute's.
+fun ctorOf v =
+  let after = V.dropWhile (\t -> not (isCtorStart v t)) v in
+  match V.get after 0 with
+  | Just t -> text t
+  | None -> "?"
+
+fun isCtorStart v t =
+  match t with
+  | Word w -> isUpper w and not (V.elem w (attributeNames v))
+  | _ -> False
+
+fun attributeNames v =
+  V.foldl
+    (\acc i ->
+      if isPunct "@" (V.getOr (Punct "") v i) then
+        match word (V.getOr (Punct "") v (i + 1)) with
+        | Just w -> V.pushBack acc w
+        | None -> acc
+      else acc)
+    []
+    (V.range 0 (V.len v))
+
+-- Whether the variant takes the text that matched it: it does when it has a
+-- field, and `String` is the only field a lexer knows how to fill.
+fun takesText v =
+  let ctor = ctorOf v in
+  V.any (\t -> isWord "String" t) (V.dropWhile (\t -> text t != ctor) v)
+
+fun isUpper w =
+  match S.byteAt w 0 with
+  | Just b -> b >= 65 and b <= 90
+  | None -> False
+
+fun lower w =
+  if S.isEmpty w then w
+  else S.toLower (S.take w 1) ++ S.drop w 1
+
+-- --- writing the table out -----------------------------------------------------
+
+fun showMoves moves =
+  "[${S.join ", " (V.map showRow moves)}]"
+
+fun showRow row =
+  "[${S.join ", " (V.map showMove row)}]"
+
+fun showMove m =
+  match m with
+  | (lo, hi, to) -> "(${show lo}, ${show hi}, ${show to})"
+
+fun showInts xs = "[${S.join ", " (V.map show xs)}]"
+
+-- --- tests -------------------------------------------------------------------
+
+use Std.Test (assertEq, assertTrue)
+
+-- The declaration above, as the tokens a derive is given.
+fun declared () =
+  [Punct "@", Word "derive", Group Paren [Word "Lexer"],
+    Punct "@", Word "skip", Group Paren [Str " +"],
+    Word "data", Word "Token", Punct "=",
+    Punct "@", Word "token", Group Paren [Str "+"], Word "Plus",
+    Punct "|",
+    Punct "@", Word "regex", Group Paren [Str "[0-9]+"], Word "Number", Word "String"]
+
+@test fun aDeclarationIsReadForItsNameAndVariants () =
+  match declaration (declared ()) with
+  | Err why -> assertTrue False why
+  | Ok (name, skips, variants) ->
+      let a = assertEq name "Token" "the type's name" in
+      let b = assertEq skips [" +"] "what is skipped" in
+      assertEq (V.len variants) 2 "two variants"
+
+@test fun aVariantSaysWhatItMatchesAndWhetherItTakesTheText () =
+  match declaration (declared ()) with
+  | Err why -> assertTrue False why
+  | Ok (_, _, variants) ->
+      let plus = V.getOr [] variants 0 in
+      let number = V.getOr [] variants 1 in
+      let a = assertEq (ctorOf plus) "Plus" "the first constructor" in
+      let b = assertEq (ctorOf number) "Number" "the second" in
+      let c = assertTrue (not (takesText plus)) "a bare variant takes nothing" in
+      assertTrue (takesText number) "one with a `String` field takes the text"
+
+@test fun aTokenIsMatchedExactly () =
+  -- `+` means a plus sign, not "one or more of what came before".
+  assertEq (quoted "a+b") "a\\+b" "the meta characters are escaped"
+
+@test fun aVariantWithNoPatternIsRefused () =
+  match patternOf [Word "Plus"] with
+  | Err why -> assertTrue (S.contains "says nothing about what it matches" why) why
+  | Ok _ -> assertTrue False "it should have been refused"
+
+@test fun aPatternThatIsNotOneIsRefused () =
+  match patternOf [Punct "@", Word "regex", Group Paren [Str "[a"], Word "Bad"] with
+  | Err why -> assertTrue (S.contains "not a pattern" why) why
+  | Ok _ -> assertTrue False "it should have been refused"
+
+@test fun whatIsWrittenIsWhatItRunsOn () =
+  match declaration (declared ()) with
+  | Err why -> assertTrue False why
+  | Ok (name, skips, variants) ->
+      match patterns variants skips with
+      | Err why -> assertTrue False why
+      | Ok res ->
+          let out = written name skips variants (compile res) in
+          let a = assertTrue (S.contains "@pub fun lexToken input" out) "a function named for the type" in
+          let b = assertTrue (S.contains "def tokenTable = Dfa" out) "a table" in
+          let c = assertTrue (S.contains "Token.Plus" out) "a constructor with no text" in
+          assertTrue (S.contains "(Token.Number text)" out) "and one with it"

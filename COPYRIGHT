@@ -1,0 +1,17 @@
+This package is a port of the Rust crate `logos`
+(https://github.com/maciejhirsz/logos), whose design, syntax and matching rules
+it follows: the `@token` / `@regex` declaration, the longest-match rule and the
+first-declared tie-break are all its.
+
+Copyright (c) 2018 Maciej Hirsz <hello@maciej.codes> and the logos contributors.
+Copyright (c) 2026 the Meadow port's authors.
+
+Licensed under either of
+
+  * Apache License, Version 2.0 (LICENSE-APACHE)
+  * MIT license (LICENSE-MIT)
+
+at your option.
+
+No code was copied: the port is written in Meadow, and the automaton is built
+by this package's own regex reader and subset construction.
