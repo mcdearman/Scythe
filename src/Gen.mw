@@ -1,6 +1,7 @@
 -- `@derive(Lexer)`: reading a token declaration and writing its lexer.
 --
--- This is the macro. It runs while the package that wrote the declaration is
+-- This is the macro -- `@macro` below is what says so. It runs while the
+-- package that wrote the declaration is
 -- compiled, so everything expensive -- parsing the patterns, building the
 -- automaton -- happens once, there, and what is left for run time is a table
 -- walk.
@@ -24,9 +25,10 @@ use Std.Collections.Vector as V
 use Std.String as S
 use Std.Maybe.Maybe.*
 use Std.Result.Result.*
-use logos.Regex (parse)
-use logos.Automaton (compile, dfaMoves, dfaAccepts)
+use Logos.Regex (parse)
+use Logos.Automaton (compile, dfaMoves, dfaAccepts)
 
+@macro
 @pub fun lexer ts =
   match declaration ts with
   | Err why -> fail why
@@ -141,7 +143,7 @@ def metaBytes = [40, 41, 91, 93, 123, 125, 46, 42, 43, 63, 124, 94, 36, 92, 45]
 fun written name skips variants d =
   let ids = V.range 0 (V.len variants) in
   let skipIds = V.map (\i -> V.len variants + i) (V.range 0 (V.len skips)) in
-  "use logos (Dfa, scan)
+  "use Logos (Dfa, scan)
 
 def ${lower name}Table = Dfa ${showMoves (dfaMoves d)} ${showInts (dfaAccepts d)}
 

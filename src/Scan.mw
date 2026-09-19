@@ -9,7 +9,7 @@ use Std.Collections.Vector as V
 use Std.String as S
 use Std.Maybe.Maybe.*
 use Std.Result.Result.*
-use logos.Automaton (Dfa, longestFrom, bytesOf)
+use Logos.Automaton (Dfa, longestFrom, bytesOf)
 use Lexed.*
 use Error.*
 
@@ -48,9 +48,9 @@ fun scanning d skip make input bytes at sofar =
 -- --- tests -------------------------------------------------------------------
 
 use Std.Test (assertEq, assertTrue)
-use logos.Automaton (compile)
-use logos.Regex (parse)
-use logos.Regex.Re.*
+use Logos.Automaton (compile)
+use Logos.Regex (parse)
+use Logos.Regex.Re.*
 
 fun table patterns =
   compile (V.map (\p -> match p with | (id, text) ->

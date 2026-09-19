@@ -18,8 +18,8 @@ use Std.Collections.HashMap as M
 use Std.String as S
 use Std.Maybe.Maybe.*
 use Std.Sort (sort, sortBy)
-use logos.Regex (Re)
-use logos.Regex.Re.*
+use Logos.Regex (Re)
+use Logos.Regex.Re.*
 
 -- A nondeterministic automaton: for each state, the byte ranges it moves on
 -- and the states it reaches without reading anything.
@@ -223,7 +223,7 @@ fun key states = S.join "," (V.map show states)
 -- --- tests -------------------------------------------------------------------
 
 use Std.Test (assertEq, assertTrue)
-use logos.Regex (parse)
+use Logos.Regex (parse)
 
 fun dfaOf patterns =
   compile (V.map (\p -> match p with | (id, text) ->

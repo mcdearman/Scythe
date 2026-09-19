@@ -1,6 +1,6 @@
 [package]
-name = "calc"
+name = "Calc"
 version = "0.1.0"
 
 [dependencies]
-logos = { path = ".." }
+Logos = { path = ".." }

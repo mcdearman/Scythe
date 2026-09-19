@@ -5,7 +5,7 @@ mod Automaton
 mod Scan
 mod Gen
 
-@pub use logos.Regex (parse)
-@pub use logos.Automaton (Dfa, compile, longest, longestFrom, bytesOf)
-@pub use logos.Scan (Lexed, Error, scan, token, start, stop, errorAt)
-@pub use logos.Gen (lexer)
+@pub use Logos.Regex (parse)
+@pub use Logos.Automaton (Dfa, compile, longest, longestFrom, bytesOf)
+@pub use Logos.Scan (Lexed, Error, scan, token, start, stop, errorAt)
+@pub use Logos.Gen (lexer)

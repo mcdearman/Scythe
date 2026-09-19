@@ -4,7 +4,7 @@
 -- while this package is compiled. Run it with `meadow run` from this
 -- directory.
 
-use logos (lexer!, token, start, stop, errorAt)
+use Logos (lexer!, token, start, stop, errorAt)
 use Std.Collections.Vector as V
 
 @derive(Lexer)

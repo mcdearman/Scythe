@@ -3,7 +3,7 @@
 A lexer written for you, from the tokens you declare.
 
 ```meadow
-use logos (lexer!, token)
+use Logos (lexer!, token)
 
 @derive(Lexer)
 @skip("[ \t\r\n]+")
