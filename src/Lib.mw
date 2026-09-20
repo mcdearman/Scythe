@@ -6,6 +6,10 @@ mod Scan
 mod Gen
 
 @pub use Logos.Regex (parse)
-@pub use Logos.Automaton (Dfa, compile, longest, longestFrom, bytesOf)
+@pub use Logos.Automaton (
+  readInts,
+  Dfa, compile, longest, longestFrom, next, bytesOf,
+  dfaClassOf, dfaTrans, dfaAccepts, dfaClasses, dfaStates,
+)
 @pub use Logos.Scan (Lexed, Error, scan, token, start, stop, errorAt)
 @pub use Logos.Gen (lexer)

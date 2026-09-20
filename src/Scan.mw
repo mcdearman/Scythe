@@ -4,6 +4,17 @@
 -- so it lives here rather than being written out for each one. What a
 -- generated lexer supplies is its table, which of its tokens are skipped, and
 -- how to build a token from the number the table answers with.
+--
+-- Two things logos does are done here rather than in the automaton:
+--
+-- * **the input is taken apart once.** logos scans a `&[u8]` and indexes it;
+--   the bytes here are pulled out of the string once, as an array, and every
+--   token after that is read out of the same array. Turning them into a
+--   persistent vector instead would put a tree walk under every byte.
+-- * **the text is cut only when somebody wants it.** logos's `Lexer::slice`
+--   is called from a token's callback, so a token nobody asks about never
+--   pays for its text. A skipped token -- whitespace, a comment -- is the
+--   common case, and it now costs nothing but the bytes it steps over.
 
 use Std.Collections.Vector as V
 use Std.String as S
@@ -30,20 +41,28 @@ use Error.*
 -- `skip` is the token numbers to drop -- whitespace, comments -- and `make`
 -- builds a token from its number and the text that matched it.
 @pub fun scan d skip make input =
-  scanning d skip make input (bytesOf input) 0 []
-
-fun scanning d skip make input bytes at sofar =
-  if at >= V.len bytes then Ok sofar
-  else
-    let (id, upto) = longestFrom d bytes at in
-    -- A pattern that matches nothing at all would leave the scan where it is,
-    -- so it counts as no match: better an error than a loop.
-    if id < 0 or upto <= at then Err (Unexpected at)
+  let bytes = bytesOf input in
+  let n = arrayLen bytes in
+  let rec go at sofar =
+    if at >= n then Ok sofar
     else
-      let text = S.slice input at upto in
-      let kept = if V.elem id skip then sofar
-                 else V.pushBack sofar (Lexed (make id text) at upto) in
-      scanning d skip make input bytes upto kept
+      let (id, upto) = longestFrom d bytes at in
+      -- A pattern that matches nothing at all would leave the scan where it is,
+      -- so it counts as no match: better an error than a loop.
+      if id < 0 or upto <= at then Err (Unexpected at)
+      else if skipped skip id then go upto sofar
+      else
+        -- The only place the text is cut, and only for a token that is kept.
+        let text = S.fromBytes (arraySlice bytes at upto) in
+        go upto (V.pushBack sofar (Lexed (make id text) at upto)) in
+  go 0 []
+
+-- Whether `id` is one of the numbers to drop. There are a handful of these at
+-- most -- one per `@skip` -- so a walk over them beats anything cleverer.
+fun skipped skip id =
+  let n = arrayLen skip in
+  let rec go i = if i >= n then False else if arrayGet skip i == id then True else go (i + 1) in
+  go 0
 
 -- --- tests -------------------------------------------------------------------
 
@@ -58,22 +77,29 @@ fun table patterns =
 
 @test fun aScanIsEveryTokenInOrder () =
   let d = table [(0, "[0-9]+"), (1, "\\+"), (2, " +")] in
-  let out = scan d [2] (\id text -> (id, text)) "1 + 23" in
+  let out = scan d #[2] (\id text -> (id, text)) "1 + 23" in
   assertEq (V.map token (unwrap out)) [(0, "1"), (1, "+"), (0, "23")]
     "three tokens, no spaces"
 
 @test fun whatMatchesNothingIsAnError () =
   let d = table [(0, "[0-9]+")] in
-  assertEq (scan d [] (\id text -> id) "1?") (Err (Unexpected 1)) "the `?`"
+  assertEq (scan d #[] (\id text -> id) "1?") (Err (Unexpected 1)) "the `?`"
 
 @test fun aTokenKnowsWhereItWas () =
   let d = table [(0, "[0-9]+"), (1, " +")] in
-  let out = unwrap (scan d [1] (\id text -> text) "12 345") in
+  let out = unwrap (scan d #[1] (\id text -> text) "12 345") in
   let a = assertEq (V.map start out) [0, 3] "where each began" in
   assertEq (V.map stop out) [2, 6] "and where each ended"
 
 @test fun anEmptyInputIsNoTokens () =
   let d = table [(0, "[0-9]+")] in
-  assertEq (scan d [] (\id text -> id) "") (Ok []) "nothing"
+  assertEq (scan d #[] (\id text -> id) "") (Ok []) "nothing"
+
+@test fun theTextIsTheBytesThatMatched () =
+  -- The slice comes out of the byte array, not out of the string again, so a
+  -- token late in a long input costs no more than an early one.
+  let d = table [(0, "[a-z]+"), (1, " +")] in
+  let out = unwrap (scan d #[1] (\id text -> text) "alpha beta gamma") in
+  assertEq (V.map token out) ["alpha", "beta", "gamma"] "each one's own bytes"
 
 fun unwrap r = match r with | Ok v -> v | Err _ -> []

@@ -26,7 +26,7 @@ use Std.String as S
 use Std.Maybe.Maybe.*
 use Std.Result.Result.*
 use Logos.Regex (parse)
-use Logos.Automaton (compile, dfaMoves, dfaAccepts)
+use Logos.Automaton (compile, dfaClassOf, dfaTrans, dfaAccepts, dfaClasses, dfaStates)
 
 @macro
 @pub fun lexer ts =
@@ -143,12 +143,29 @@ def metaBytes = [40, 41, 91, 93, 123, 125, 46, 42, 43, 63, 124, 94, 36, 92, 45]
 fun written name skips variants d =
   let ids = V.range 0 (V.len variants) in
   let skipIds = V.map (\i -> V.len variants + i) (V.range 0 (V.len skips)) in
-  "use Logos (Dfa, scan)
+  let t = lower name in
+  -- Each array is given a name of its own rather than being written inside the
+  -- `Dfa`: a literal is a register apiece while the block that builds it runs,
+  -- and three of them in one expression is more than the allocator will take.
+  "use Logos (Dfa, scan, readInts)
 
-def ${lower name}Table = Dfa ${showMoves (dfaMoves d)} ${showInts (dfaAccepts d)}
+-- A byte's class. Bytes no pattern tells apart share one, so this is the only
+-- 256-wide thing a lexer carries.
+def ${t}ClassOf = readInts \"${showArray (dfaClassOf d)}\"
+
+-- A state and a class to the next state, or -1 where there is none.
+-- ${show (dfaStates d)} states by ${show (dfaClasses d)} classes.
+def ${t}Trans = readInts \"${showArray (dfaTrans d)}\"
+
+-- What each state accepts, or -1 for one that accepts nothing.
+def ${t}Accepts = readInts \"${showArray (dfaAccepts d)}\"
+
+def ${t}Table = Dfa ${t}ClassOf ${t}Trans ${t}Accepts ${show (dfaClasses d)}
+
+def ${t}Skip = readInts \"${showIntArray skipIds}\"
 
 @pub fun lex${name} input =
-  scan ${lower name}Table ${showInts skipIds} (\\id text -> ${arms name variants ids}) input"
+  scan ${t}Table ${t}Skip (\\id text -> ${arms name variants ids}) input"
 
 -- `if id == 0 then Type.Plus else …`, and a token that takes the text is given
 -- it. The last arm needs no test: the table answers with nothing else.
@@ -208,17 +225,12 @@ fun lower w =
 
 -- --- writing the table out -----------------------------------------------------
 
-fun showMoves moves =
-  "[${S.join ", " (V.map showRow moves)}]"
+-- An array of numbers, as the text `readInts` reads back. A literal would be
+-- the obvious thing to write and is the one thing that cannot be: see
+-- `readInts` for why a table travels as a string.
+fun showArray a = showIntArray (V.fromArray a)
 
-fun showRow row =
-  "[${S.join ", " (V.map showMove row)}]"
-
-fun showMove m =
-  match m with
-  | (lo, hi, to) -> "(${show lo}, ${show hi}, ${show to})"
-
-fun showInts xs = "[${S.join ", " (V.map show xs)}]"
+fun showIntArray xs = S.join "," (V.map show xs)
 
 -- --- tests -------------------------------------------------------------------
 
@@ -275,6 +287,6 @@ fun declared () =
       | Ok res ->
           let out = written name skips variants (compile res) in
           let a = assertTrue (S.contains "@pub fun lexToken input" out) "a function named for the type" in
-          let b = assertTrue (S.contains "def tokenTable = Dfa" out) "a table" in
+          let b = assertTrue (S.contains "def tokenTable = Dfa" out and S.contains "readInts" out) "a table" in
           let c = assertTrue (S.contains "Token.Plus" out) "a constructor with no text" in
           assertTrue (S.contains "(Token.Number text)" out) "and one with it"

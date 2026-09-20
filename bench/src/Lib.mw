@@ -1,0 +1,135 @@
+-- What the optimisations were worth, over the same bytes twice.
+--
+-- `meadow run --release` here lexes `corpus.calc` with three lexers and reports
+-- how many bytes a second each gets through:
+--
+--   * **before** -- the engine as it was, kept in `Baseline.mw`;
+--   * **after** -- the same grammar through `@derive(Lexer)` as it now stands;
+--   * **after, kinds only** -- the same again from a declaration whose variants
+--     carry no text, which is what Rust's logos does by default and so what the
+--     numbers in `bench/rust` should be read against.
+--
+-- The grammar is written out three times over, and it is the same grammar each
+-- time: `bench/rust/src/main.rs` writes it a fourth time, for logos.
+
+mod Baseline
+
+use Logos (lexer!, token, errorAt)
+use LogosBench.Baseline (oldCompile, oldScan)
+use Logos.Regex (parse)
+use Logos.Regex.Re.*
+use Std.Time (monotonic)
+use Std.Collections.Vector as V
+use Std.String as S
+use Std.Fs (readToStringOr)
+use Std.Maybe.Maybe.*
+use Std.Result.Result.*
+
+-- --- the grammar, as a derive writes it ----------------------------------------
+
+@derive(Lexer)
+@skip("[ \t\r\n]+")
+@skip("--[^\n]*")
+data Token
+  = @token("+") Plus
+  | @token("-") Minus
+  | @token("*") Star
+  | @token("/") Slash
+  | @token("=") Equals
+  | @token("(") LParen
+  | @token(")") RParen
+  | @token("let") Let
+  | @regex("[0-9]+(\\.[0-9]+)?") Number String
+  | @regex("[a-zA-Z_][a-zA-Z0-9_]*") Ident String
+
+-- The same grammar with nothing carrying its text, which is how logos lexes
+-- unless a callback asks for the slice. Kept apart so the cost of cutting the
+-- text out is visible rather than buried.
+@derive(Lexer)
+@skip("[ \t\r\n]+")
+@skip("--[^\n]*")
+data Kind
+  = @token("+") KPlus
+  | @token("-") KMinus
+  | @token("*") KStar
+  | @token("/") KSlash
+  | @token("=") KEquals
+  | @token("(") KLParen
+  | @token(")") KRParen
+  | @token("let") KLet
+  | @regex("[0-9]+(\\.[0-9]+)?") KNumber
+  | @regex("[a-zA-Z_][a-zA-Z0-9_]*") KIdent
+
+-- --- the same grammar, for the engine as it was ---------------------------------
+
+-- Patterns in the order the machine numbers them: the tokens first, then what
+-- is skipped, which is what the derive does too.
+def oldPatterns =
+  [ "\\+", "\\-", "\\*", "/", "=", "\\(", "\\)", "let"
+  , "[0-9]+(\\.[0-9]+)?", "[a-zA-Z_][a-zA-Z0-9_]*"
+  , "[ \t\r\n]+", "\\-\\-[^\n]*" ]
+
+def oldTable =
+  oldCompile
+    (V.map
+      (\p -> match p with | (i, text) ->
+        (i, match parse text with | Ok re -> re | Err _ -> Empty))
+      (V.zip (V.range 0 (V.len oldPatterns)) oldPatterns))
+
+def oldSkip = [10, 11]
+
+fun oldLex input = oldScan oldTable oldSkip (\id text -> id) input
+
+-- --- running -------------------------------------------------------------------
+--
+-- Best of a few runs over the same bytes, reported as bytes a second. The best
+-- rather than the mean because the work is deterministic: every run does
+-- exactly the same thing, so the spread is the machine's doing and the fastest
+-- run is the one it interfered with least. `bench/rust` measures the same way
+-- over the same file, which is what makes the two columns comparable.
+--
+-- `Std.Bench` would be the idiomatic thing to reach for and is not used here:
+-- its warm-up runs the benchmark at least sixty-four times before it measures
+-- anything, and sixty-four runs of the unoptimised lexer is most of a minute.
+
+fun corpus () = readToStringOr "" "corpus.calc"
+
+fun countOf r = match r with | Ok ts -> V.len ts | Err _ -> 0
+
+-- The shortest time `act` took over `reps` runs, in nanoseconds.
+fun bestOf reps act =
+  let rec go k best =
+    if k <= 0 then best
+    else
+      let t0 = monotonic () in
+      let _ = act () in
+      let t1 = monotonic () in
+      let took = t1 - t0 in
+      go (k - 1) (if best < 0 or took < best then took else best) in
+  go reps (0 - 1)
+
+fun report name bytes nanos =
+  let perSecond = bytes * 1000000000 / nanos in
+  println "${pad 22 name}${pad 12 "${show (nanos / 1000)} us"}${pad 14 "${show (perSecond / 1000)} KB/s"}"
+
+fun pad n s = if S.byteLength s >= n then s ++ "  " else pad n (s ++ " ")
+
+fun run name bytes reps act = report name bytes (bestOf reps act)
+
+def main =
+  let text = corpus () in
+  let bytes = S.byteLength text in
+  if bytes == 0 then
+    println "corpus.calc is not where this expects it: run `meadow run` from `bench/`."
+  else
+    let tokens = countOf (lexToken text) in
+    let _ = println "corpus.calc: ${show bytes} bytes, ${show tokens} tokens" in
+    -- Two lexers that disagree about how many tokens are in the file are not
+    -- lexing the same thing, and neither number below would mean anything.
+    let agree = countOf (oldLex text) == tokens and countOf (lexKind text) == tokens in
+    let _ = println "all three agree on the count: ${show agree}" in
+    let _ = println "" in
+    let _ = println "${pad 22 "lexer"}${pad 12 "best"}${pad 14 "throughput"}" in
+    let _ = run "before" bytes 3 (\() -> countOf (oldLex text)) in
+    let _ = run "after" bytes 5 (\() -> countOf (lexToken text)) in
+    run "after, kinds only" bytes 5 (\() -> countOf (lexKind text))

@@ -12,6 +12,36 @@
 -- the alphabet is split at the boundaries those ranges mention rather than
 -- into 256 letters -- which is what keeps the second step affordable to run
 -- during a build.
+--
+-- --- what logos does, and what is done here -----------------------------------
+--
+-- The subset construction answers a *correct* machine, not a small or a quick
+-- one. logos puts four passes between that machine and the code it emits, and
+-- all four are here:
+--
+-- * **dead ends are pruned.** A state that cannot reach an accepting state can
+--   only ever end in a backtrack, so logos walks the graph backwards from the
+--   accepting states and throws away everything it does not reach. A scan that
+--   would have read to the end of an identifier before giving up now stops at
+--   the byte that made it hopeless.
+-- * **equivalent states are merged, to a fixed point.** Two states that accept
+--   the same token and move the same way are the same state. Merging two can
+--   make two more identical, so logos repeats the pass until the count stops
+--   falling -- which is what `minimize` does here.
+-- * **the alphabet is cut to byte classes.** logos carries a `ByteClass` per
+--   edge rather than 256 separate cases; two bytes no pattern tells apart cost
+--   one column between them, not two.
+-- * **dispatch is a lookup, not a search.** logos emits `TABLE[byte as usize]`
+--   for any state with more than two outgoing edges. The table here is the same
+--   idea laid out flat: `trans[state * classes + classOf[byte]]`, two indexed
+--   reads and no comparison chain.
+--
+-- The one place this parts company with logos is *where* the width goes. logos
+-- emits a full 256-entry table per state, which costs a Rust `const` nothing.
+-- Emitting that many integers as Meadow source is what costs here, so the
+-- classes stay folded: `classOf` is the only 256-wide array, and the transition
+-- table is states by classes. Equivalent columns are merged too, so a table
+-- narrows to the distinctions the patterns actually draw.
 
 use Std.Collections.Vector as V
 use Std.Collections.HashMap as M
@@ -25,12 +55,55 @@ use Logos.Regex.Re.*
 -- and the states it reaches without reading anything.
 @pub data Nfa = Nfa [[(Int, Int, Int)]] [[Int]]
 
--- A machine to walk: for each state the ranges it moves on, and what each
--- state accepts -- a token's number, or -1 for a state that accepts nothing.
-@pub data Dfa = Dfa [[(Int, Int, Int)]] [Int]
+-- A machine to walk.
+--
+-- `classOf` is 256 long and sends a byte to its class; `trans` is `states` by
+-- `classes` and sends a state and a class to the next state, or to -1 where
+-- there is no move; `accepts` says what each state accepts, or -1 for a state
+-- that accepts nothing. All three are arrays rather than vectors because this
+-- is the one part of the library that runs per byte, and an array is read in
+-- constant time where a persistent vector walks a tree.
+@pub data Dfa = Dfa (Array Int) (Array Int) (Array Int) Int
 
-@pub fun dfaMoves d = match d with | Dfa moves _ -> moves
-@pub fun dfaAccepts d = match d with | Dfa _ accepts -> accepts
+@pub fun dfaClassOf d = match d with | Dfa c _ _ _ -> c
+@pub fun dfaTrans d = match d with | Dfa _ t _ _ -> t
+@pub fun dfaAccepts d = match d with | Dfa _ _ a _ -> a
+@pub fun dfaClasses d = match d with | Dfa _ _ _ n -> n
+
+-- How many states the machine has: `accepts` has one entry each.
+@pub fun dfaStates d = arrayLen (dfaAccepts d)
+
+-- --- a table, as text and back ---------------------------------------------------
+--
+-- A derive has to write its table into the source it generates, and an array
+-- literal is not the way: Meadow gives every element of one its own register
+-- while the block that builds it runs, and the allocator does not spill, so a
+-- literal of a few hundred numbers is refused outright. A string has no such
+-- cost, whatever its length.
+--
+-- So a table is written as text and read back here -- once, on the first look
+-- at the `def` that holds it, because a `def` is evaluated once and remembered.
+-- Nothing per byte of input touches this; by the time a scan starts the table
+-- is an array like any other.
+
+-- The numbers in `s`, which are separated by commas and may be negative.
+@pub fun readInts s =
+  let bytes = S.toBytes s in
+  let n = arrayLen bytes in
+  let rec go i out cur neg any =
+    if i >= n then (if any then V.pushBack out (signed cur neg) else out)
+    else
+      let b = toInt (arrayGet bytes i) in
+      -- `,` ends a number, `-` opens a negative one, and anything else is a digit.
+      if b == 44 then go (i + 1) (V.pushBack out (signed cur neg)) 0 False False
+      else if b == 45 then go (i + 1) out cur True any
+      else go (i + 1) out (cur * 10 + (b - 48)) neg True in
+  V.toArray (go 0 [] 0 False False)
+
+fun signed cur neg = if neg then 0 - cur else cur
+
+-- "there is no such state", in a transition table and in an accept table.
+@pub def none = 0 - 1
 
 -- --- building the nondeterministic one ----------------------------------------
 
@@ -130,7 +203,11 @@ fun step n states lo hi =
 
 -- Every byte where a range begins or ends: the alphabet, in as few pieces as
 -- the patterns can tell apart.
-fun alphabet n =
+fun alphabet n = lettersOf (nfaMoves n)
+
+-- The same, over any table of `(lo, hi, to)` rows. The boundaries the rows
+-- mention cut 0..255 into the pieces no row can tell apart.
+fun lettersOf rows =
   let edges =
     V.foldl
       (\acc ms ->
@@ -139,7 +216,7 @@ fun alphabet n =
           acc
           ms)
       [0]
-      (nfaMoves n) in
+      rows in
     let points = sort (V.filter (\p -> p <= 255) edges) in
     intervals (dedup points) []
 
@@ -173,7 +250,10 @@ fun intervals points sofar =
                 (m3, V.pushBack es (ended, id)))
       (start, [])
       patterns in
-    subset n ends
+    let (moves, accepts) = subset n ends in
+    let (moves1, accepts1) = prune moves accepts in
+    let (moves2, accepts2) = minimize moves1 accepts1 in
+    tabulate moves2 accepts2
 
 fun subset n ends =
   let letters = alphabet n in
@@ -183,7 +263,7 @@ fun subset n ends =
 -- One state of the machine at a time, adding whatever it leads to.
 fun explore n ends letters todo seen moves accepts =
   match V.toList todo with
-  | Nil -> Dfa moves accepts
+  | Nil -> (moves, accepts)
   | Cons states rest ->
       let (rows, todo1, seen1) =
         V.foldl
@@ -214,11 +294,261 @@ fun accepting ends states =
       match e with
       | (state, id) ->
           if V.elem state states and (best < 0 or id < best) then id else best)
-    (0 - 1)
+    none
     ends
 
 -- A set of states, as text, so it can be looked up.
 fun key states = S.join "," (V.map show states)
+
+-- --- pruning dead ends ---------------------------------------------------------
+--
+-- A state that cannot reach an accepting state has nothing to offer: every walk
+-- that enters it ends by falling back to whatever was accepted earlier. logos
+-- walks the graph backwards from its accepting states and keeps only what it
+-- reaches; the same set is found here by asking, until the answer stops
+-- changing, which states accept or lead to one that does.
+
+fun prune moves accepts =
+  let live = liveFix moves (V.map (\a -> a >= 0) accepts) in
+  -- The start state stays whatever the answer, so that a machine which accepts
+  -- nothing at all is still a machine.
+  let live1 = V.set live 0 True in
+  keepStates moves accepts live1
+
+fun liveFix moves live =
+  let next =
+    V.map
+      (\i ->
+        V.getOr False live i
+        or V.any (\m -> match m with | (_, _, to) -> V.getOr False live to)
+            (V.getOr [] moves i))
+      (V.range 0 (V.len live)) in
+  if countTrue next == countTrue live then next else liveFix moves next
+
+fun countTrue v = V.foldl (\acc b -> if b then acc + 1 else acc) 0 v
+
+-- The machine with only the states `live` marks, renumbered to close the gaps.
+fun keepStates moves accepts live =
+  let ids = renumber live in
+  let kept = V.filter (\i -> V.getOr False live i) (V.range 0 (V.len live)) in
+  (V.map
+    (\i ->
+      -- The edges that survive are chosen by the *old* number, and only then
+      -- renumbered: asking `ids` about a number it has already answered for
+      -- would be asking it the wrong question.
+      V.map
+        (\m -> match m with | (lo, hi, to) -> (lo, hi, V.getOr none ids to))
+        (V.filter
+          (\m -> match m with | (_, _, to) -> V.getOr none ids to >= 0)
+          (V.getOr [] moves i)))
+    kept,
+    V.map (\i -> V.getOr none accepts i) kept)
+
+-- Old state numbers to new ones, or to -1 for the ones being dropped.
+fun renumber live =
+  match
+    V.foldl
+      (\acc b -> match acc with | (ids, next) ->
+        if b then (V.pushBack ids next, next + 1) else (V.pushBack ids none, next))
+      ([], 0)
+      live
+  with
+  | (ids, _) -> ids
+
+-- --- merging equivalent states --------------------------------------------------
+--
+-- Two states that accept the same token and move the same way cannot be told
+-- apart, so they are one state. Merging a pair can leave two others identical,
+-- which is why logos repeats the pass until the count stops falling.
+
+fun minimize moves accepts =
+  let canon = canonical moves accepts in
+  if V.len (V.filter (\i -> V.getOr 0 canon i != i) (V.range 0 (V.len accepts))) == 0 then
+    (moves, accepts)
+  else
+    -- Point every edge at the canonical state, then drop the states that are no
+    -- longer anybody's canonical one, and go round again.
+    let rewritten =
+      V.map
+        (\row -> V.map (\m -> match m with | (lo, hi, to) -> (lo, hi, V.getOr 0 canon to)) row)
+        moves in
+    let live = V.map (\i -> V.getOr 0 canon i == i) (V.range 0 (V.len accepts)) in
+    let (moves1, accepts1) = keepStates rewritten accepts live in
+    minimize moves1 accepts1
+
+-- For each state, the first state it is indistinguishable from.
+fun canonical moves accepts =
+  match
+    V.foldl
+      (\acc i ->
+        match acc with
+        | (ids, seen) ->
+            let k = stateKey moves accepts i in
+            match M.lookup k seen with
+            | Just first -> (V.pushBack ids first, seen)
+            | None -> (V.pushBack ids i, M.insert k i seen))
+      ([], M.empty)
+      (V.range 0 (V.len accepts))
+  with
+  | (ids, _) -> ids
+
+-- A state as text: what it accepts and where it goes. The rows are built in one
+-- order for every state, so two equal states have equal text.
+fun stateKey moves accepts i =
+  "${show (V.getOr none accepts i)}|${S.join "," (V.map showMove (V.getOr [] moves i))}"
+
+fun showMove m = match m with | (lo, hi, to) -> "${show lo}-${show hi}>${show to}"
+
+-- --- laying the table out flat ---------------------------------------------------
+
+-- The machine as the three arrays a walk reads.
+fun tabulate moves accepts =
+  let letters = lettersOf moves in
+  let wide = V.len letters in
+  let classOf = classTable letters in
+  let trans = transTable moves letters wide in
+  let (classOf1, trans1, narrow) = mergeClasses classOf trans wide (V.len accepts) in
+  Dfa (V.toArray classOf1) (V.toArray trans1) (V.toArray accepts) narrow
+
+-- Each byte's class: which of the letters it falls in.
+fun classTable letters =
+  V.map
+    (\b ->
+      match
+        V.foldl
+          (\found i ->
+            match V.getOr (0, 0) letters i with
+            | (lo, hi) -> if found < 0 and lo <= b and b <= hi then i else found)
+          none
+          (V.range 0 (V.len letters))
+      with
+      | c -> if c < 0 then 0 else c)
+    (V.range 0 256)
+
+-- `states` by `wide`, read as `trans[state * wide + class]`.
+fun transTable moves letters wide =
+  V.foldl
+    (\acc s ->
+      V.foldl
+        (\row c ->
+          match V.getOr (0, 0) letters c with
+          | (lo, hi) -> V.pushBack row (target (V.getOr [] moves s) lo hi))
+        acc
+        (V.range 0 wide))
+    []
+    (V.range 0 (V.len moves))
+
+-- Where a row sends the letter `lo..hi`, or -1 where it sends it nowhere.
+fun target row lo hi =
+  V.foldl
+    (\found m ->
+      match m with
+      | (mlo, mhi, to) -> if found < 0 and mlo <= lo and hi <= mhi then to else found)
+    none
+    row
+
+-- Two classes that every state treats alike are one class. This is logos's
+-- `ByteClass::merge` seen from the table's side: it takes columns out of the
+-- table without changing a single answer it gives.
+fun mergeClasses classOf trans wide states =
+  let ids = columnIds trans wide states in
+  let narrow = 1 + V.foldl (\m c -> if c > m then c else m) 0 ids in
+  if narrow == wide then (classOf, trans, wide)
+  else
+    (V.map (\c -> V.getOr 0 ids c) classOf,
+      V.foldl
+        (\acc s ->
+          V.foldl
+            (\row c ->
+              -- The first old class that was given this new number stands for it.
+              match firstWith ids c with
+              | old -> V.pushBack row (V.getOr none trans (s * wide + old)))
+            acc
+            (V.range 0 narrow))
+        []
+        (V.range 0 states),
+      narrow)
+
+fun firstWith ids c =
+  V.foldl
+    (\found i -> if found < 0 and V.getOr none ids i == c then i else found)
+    none
+    (V.range 0 (V.len ids))
+
+-- Each class's new number: classes with the same column share one.
+fun columnIds trans wide states =
+  match
+    V.foldl
+      (\acc c ->
+        match acc with
+        | (ids, seen, next) ->
+            let k = columnKey trans wide states c in
+            match M.lookup k seen with
+            | Just id -> (V.pushBack ids id, seen, next)
+            | None -> (V.pushBack ids next, M.insert k next seen, next + 1))
+      ([], M.empty, 0)
+      (V.range 0 wide)
+  with
+  | (ids, _, _) -> ids
+
+fun columnKey trans wide states c =
+  S.join "," (V.map (\s -> show (V.getOr none trans (s * wide + c))) (V.range 0 states))
+
+-- --- walking it ------------------------------------------------------------------
+
+@pub fun bytesOf input = S.toBytes input
+
+-- Walk `input` from the start, answering what it accepts and how far it read.
+@pub fun longest d input = longestFrom d (bytesOf input) 0
+
+-- The same, from `at` in bytes already taken apart: what a scanner walking a
+-- whole input calls, once per token.
+--
+-- The table is pulled out of the `Dfa` once and then read directly, and the
+-- loop below carries only what changes -- the state, where it is, and the best
+-- match so far. Everything it touches per byte is an array read.
+@pub fun longestFrom d bytes at =
+  match d with
+  | Dfa classOf trans accepts wide ->
+      let n = arrayLen bytes in
+      -- logos's fast loop: a state whose edge points back at itself is a run --
+      -- an identifier, a number, a stretch of spaces -- and a run is read
+      -- without asking anything that cannot have changed. What the state accepts
+      -- is the same at every byte of it, so it is looked at once, at the end,
+      -- rather than at each.
+      let rec spin state i =
+        if i >= n then i
+        else if arrayGet trans (state * wide + arrayGet classOf (toInt (arrayGet bytes i))) == state
+        then spin state (i + 1)
+        else i in
+      let rec walk state i bestId bestEnd =
+        -- The accept is read on entering a state, so a state is charged for it
+        -- once however many bytes it goes on to read.
+        let acc = arrayGet accepts state in
+        let bi = if acc >= 0 then acc else bestId in
+        let be = if acc >= 0 then i else bestEnd in
+        if i >= n then (bi, be)
+        else
+          let to = arrayGet trans (state * wide + arrayGet classOf (toInt (arrayGet bytes i))) in
+          if to < 0 then (bi, be)
+          else if to == state then
+            let stop = spin state (i + 1) in
+            let bi1 = if acc >= 0 then acc else bi in
+            let be1 = if acc >= 0 then stop else be in
+            if stop >= n then (bi1, be1)
+            else
+              let to1 = arrayGet trans (state * wide + arrayGet classOf (toInt (arrayGet bytes stop))) in
+              if to1 < 0 then (bi1, be1)
+              else walk to1 (stop + 1) bi1 be1
+          else walk to (i + 1) bi be in
+      walk 0 at none at
+
+-- Where `state` goes on reading `b`, or nothing.
+@pub fun next d state b =
+  match d with
+  | Dfa classOf trans _ wide ->
+      let to = arrayGet trans (state * wide + arrayGet classOf b) in
+      if to < 0 then None else Just to
 
 -- --- tests -------------------------------------------------------------------
 
@@ -228,33 +558,6 @@ use Logos.Regex (parse)
 fun dfaOf patterns =
   compile (V.map (\p -> match p with | (id, text) ->
       (id, match parse text with | Ok re -> re | Err _ -> Empty)) patterns)
-
--- Walk `input` from the start, answering what it accepts and how far it read.
-@pub fun longest d input = longestFrom d (bytesOf input) 0
-
--- The same, from `at` in bytes already taken apart: what a scanner walking a
--- whole input calls, once per token.
-@pub fun longestFrom d bytes at = walk d bytes at 0 (0 - 1) at
-
-@pub fun bytesOf input = V.map toInt (V.fromArray (S.toBytes input))
-
-fun walk d bytes at state bestId bestEnd =
-  let accepts = V.getOr (0 - 1) (dfaAccepts d) state in
-  let (id, upto) = if accepts >= 0 then (accepts, at) else (bestId, bestEnd) in
-  match V.get bytes at with
-  | None -> (id, upto)
-  | Just b ->
-      match next d state b with
-      | None -> (id, upto)
-      | Just to -> walk d bytes (at + 1) to id upto
-
-@pub fun next d state b =
-  V.foldl
-    (\found m ->
-      match m with
-      | (lo, hi, to) -> if lo <= b and b <= hi then Just to else found)
-    None
-    (V.getOr [] (dfaMoves d) state)
 
 @test fun aLiteralMatchesItself () =
   let d = dfaOf [(0, "abc")] in
@@ -290,3 +593,61 @@ fun walk d bytes at state bestId bestEnd =
 @test fun theEmptyPatternMatchesNothingAtAll () =
   let d = dfaOf [(0, "a*")] in
   assertEq (longest d "") (0, 0) "zero of them"
+
+-- --- the optimisations ---------------------------------------------------------
+
+@test fun aDeadEndIsNotWalkedInto () =
+  -- `ab` and nothing else: after `a` the only live byte is `b`, and a machine
+  -- that had kept its dead states would still have had somewhere to go on `x`.
+  let d = dfaOf [(0, "ab")] in
+  let a = assertEq (longest d "ax") (0 - 1, 0) "no match, and none pending" in
+  assertEq (next d 0 120) None "the start has no move on `x` at all"
+
+@test fun equivalentStatesAreMerged () =
+  -- Four ways to spell the same three-byte run. Told apart they would need a
+  -- state per position per branch; merged they need one chain.
+  let d = dfaOf [(0, "(ab|ac|ad|ae)")] in
+  let a = assertEq (longest d "ad") (0, 2) "still matches" in
+  assertTrue (dfaStates d <= 4) "and in at most four states, not seven"
+
+@test fun bytesNoPatternTellsApartShareAColumn () =
+  -- Nothing here distinguishes `b` from `c`, or any byte from any other byte
+  -- outside `a`..`c`, so the table is narrower than the alphabet is wide.
+  let d = dfaOf [(0, "a[bc]")] in
+  let a = assertEq (longest d "ab") (0, 2) "matches" in
+  let b = assertEq (longest d "ac") (0, 2) "either way" in
+  assertTrue (dfaClasses d <= 3) "three columns are enough"
+
+@test fun theClassTableCoversEveryByte () =
+  let d = dfaOf [(0, "[a-z]+")] in
+  let a = assertEq (arrayLen (dfaClassOf d)) 256 "one entry per byte" in
+  assertEq (arrayLen (dfaTrans d)) (dfaStates d * dfaClasses d) "states by classes"
+
+@test fun aRunIsReadByTheFastLoop () =
+  -- The self-edge that `spin` follows: many bytes, one state, one answer.
+  let d = dfaOf [(0, "[a-z]+")] in
+  assertEq (longest d "abcdefghijklmnopqrstuvwxyz!") (0, 26) "all of the letters"
+
+@test fun aRunThatEndsTheInputStillAccepts () =
+  let d = dfaOf [(0, "[0-9]+")] in
+  assertEq (longest d "4321") (0, 4) "the fast loop runs into the end"
+
+@test fun aTableSurvivesBeingWrittenDown () =
+  -- What a derive writes into its source and what it reads back are the same
+  -- numbers, negatives and all.
+  let a = assertEq (V.fromArray (readInts "0,1,2")) [0, 1, 2] "three of them" in
+  let b = assertEq (V.fromArray (readInts "-1,17,-1")) [0 - 1, 17, 0 - 1] "and the empty ones" in
+  let c = assertEq (V.fromArray (readInts "")) [] "nothing at all" in
+  assertEq (V.fromArray (readInts "42")) [42] "one on its own"
+
+@test fun aWrittenTableWalksTheSameWay () =
+  -- The point of the round trip: a machine rebuilt from text answers as the
+  -- machine it was written from.
+  let d = dfaOf [(0, "let"), (1, "[a-z]+")] in
+  let rebuilt =
+    Dfa (readInts (S.join "," (V.map show (V.fromArray (dfaClassOf d)))))
+        (readInts (S.join "," (V.map show (V.fromArray (dfaTrans d)))))
+        (readInts (S.join "," (V.map show (V.fromArray (dfaAccepts d)))))
+        (dfaClasses d) in
+  let a = assertEq (longest rebuilt "let") (longest d "let") "the keyword" in
+  assertEq (longest rebuilt "letter") (longest d "letter") "and the identifier"

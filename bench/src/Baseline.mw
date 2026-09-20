@@ -1,0 +1,280 @@
+-- The lexer as it was before the optimisations, kept so the difference can be
+-- measured rather than asserted.
+--
+-- This is the original engine, verbatim except for its name: the subset
+-- construction with no pruning and no merging, a table of byte ranges per
+-- state searched linearly on every byte, and an input turned into a persistent
+-- vector so that reading one byte walks a tree. `Logos.Automaton` is what it
+-- became; `bench` runs the two over the same bytes.
+
+use Std.Collections.Vector as V
+use Std.Collections.HashMap as M
+use Std.String as S
+use Std.Maybe.Maybe.*
+use Std.Result.Result.*
+use Std.Sort (sort, sortBy)
+use Logos.Regex (Re, parse)
+use Logos.Regex.Re.*
+use OldLexed.*
+use OldError.*
+
+-- A nondeterministic automaton: for each state, the byte ranges it moves on
+-- and the states it reaches without reading anything.
+@pub data ONfa = ONfa [[(Int, Int, Int)]] [[Int]]
+
+-- A machine to walk: for each state the ranges it moves on, and what each
+-- state accepts -- a token's number, or -1 for a state that accepts nothing.
+@pub data ODfa = ODfa [[(Int, Int, Int)]] [Int]
+
+@pub fun dfaMoves d = match d with | ODfa moves _ -> moves
+@pub fun dfaAccepts d = match d with | ODfa _ accepts -> accepts
+
+-- --- building the nondeterministic one ----------------------------------------
+
+fun nfaMoves n = match n with | ONfa moves _ -> moves
+fun nfaEps n = match n with | ONfa _ eps -> eps
+
+fun fresh n =
+  match n with
+  | ONfa moves eps -> (ONfa (V.pushBack moves []) (V.pushBack eps []), V.len moves)
+
+fun addMove n from lo hi to =
+  match n with
+  | ONfa moves eps ->
+      ONfa (V.updateAt moves from (\ms -> V.pushBack ms (lo, hi, to))) eps
+
+fun addEps n from to =
+  match n with
+  | ONfa moves eps -> ONfa moves (V.updateAt eps from (\es -> V.pushBack es to))
+
+-- Everything `re` matches, as states leading out of `from`. Answers the
+-- machine and the state it ends in.
+fun build n from re =
+  match re with
+  | Empty -> (n, from)
+  | Lit b ->
+      let (n1, to) = fresh n in
+      (addMove n1 from b b to, to)
+  | Class negated ranges ->
+      let (n1, to) = fresh n in
+      let rs = if negated then complement ranges else ranges in
+      (V.foldl (\m r -> match r with | (lo, hi) -> addMove m from lo hi to) n1 rs, to)
+  | Cat rs -> V.foldl (\acc r -> match acc with | (m, at) -> build m at r) (n, from) rs
+  | Alt rs ->
+      let (n1, out) = fresh n in
+      (V.foldl
+        (\m r ->
+          let (m1, entry) = fresh m in
+          let m2 = addEps m1 from entry in
+          let (m3, ended) = build m2 entry r in
+          addEps m3 ended out)
+        n1
+        rs,
+        out)
+  | Star r ->
+      -- One state that is both the way in and the way out, so it accepts nothing
+      -- as readily as it accepts many.
+      let (n1, loop) = fresh n in
+      let n2 = addEps n1 from loop in
+      let (n3, ended) = build n2 loop r in
+      (addEps n3 ended loop, loop)
+
+-- The ranges 0..255 leaves out.
+@pub fun complement ranges =
+  let sorted = sortBy (\a b -> compare (lowOf a) (lowOf b)) ranges in
+  gaps sorted 0 []
+
+fun lowOf r = match r with | (lo, _) -> lo
+
+fun gaps ranges at sofar =
+  match V.toList ranges with
+  | Nil -> if at <= 255 then V.pushBack sofar (at, 255) else sofar
+  | Cons r rest ->
+      match r with
+      | (lo, hi) ->
+          let kept = if at < lo then V.pushBack sofar (at, lo - 1) else sofar in
+          gaps (V.fromList rest) (if hi + 1 > at then hi + 1 else at) kept
+
+-- --- making it deterministic ---------------------------------------------------
+
+-- The states reachable from `states` without reading anything, themselves
+-- included.
+fun closure n states = closureOf n (V.toList states) states
+
+fun closureOf n todo seen =
+  match todo with
+  | Nil -> seen
+  | Cons s rest ->
+      let next = V.getOr [] (nfaEps n) s in
+      let unseen = V.filter (\t -> not (V.elem t seen)) next in
+      closureOf n (V.toList (V.append (V.fromList rest) unseen)) (V.append seen unseen)
+
+-- Where `states` go on reading a byte in `lo..hi`.
+fun step n states lo hi =
+  V.foldl
+    (\acc s ->
+      V.foldl
+        (\inner m ->
+          match m with
+          | (mlo, mhi, to) ->
+              if mlo <= lo and hi <= mhi and not (V.elem to inner) then
+                V.pushBack inner to
+              else inner)
+        acc
+        (V.getOr [] (nfaMoves n) s))
+    []
+    states
+
+-- Every byte where a range begins or ends: the alphabet, in as few pieces as
+-- the patterns can tell apart.
+fun alphabet n =
+  let edges =
+    V.foldl
+      (\acc ms ->
+        V.foldl
+          (\inner m -> match m with | (lo, hi, _) -> V.pushBack (V.pushBack inner lo) (hi + 1))
+          acc
+          ms)
+      [0]
+      (nfaMoves n) in
+    let points = sort (V.filter (\p -> p <= 255) edges) in
+    intervals (dedup points) []
+
+fun dedup v =
+  V.foldl (\acc x -> if V.elem x acc then acc else V.pushBack acc x) [] v
+
+fun intervals points sofar =
+  match V.toList points with
+  | Nil -> sofar
+  | Cons p rest ->
+      let hi = match rest with | Nil -> 255 | Cons q _ -> q - 1 in
+      intervals (V.fromList rest) (if p <= hi then V.pushBack sofar (p, hi) else sofar)
+
+-- The machine `patterns` make, with each state saying which token it accepts.
+--
+-- `patterns` is a token's number and its pattern, in the order they were
+-- declared: where two of them match the same text, the earlier one wins, which
+-- is the rule logos follows and the one that lets a keyword beat an identifier.
+@pub fun oldCompile patterns =
+  let start = ONfa [[]] [[]] in
+  let (n, ends) =
+    V.foldl
+      (\acc p ->
+        match acc with
+        | (m, es) ->
+            match p with
+            | (id, re) ->
+                let (m1, entry) = fresh m in
+                let m2 = addEps m1 0 entry in
+                let (m3, ended) = build m2 entry re in
+                (m3, V.pushBack es (ended, id)))
+      (start, [])
+      patterns in
+    subset n ends
+
+fun subset n ends =
+  let letters = alphabet n in
+  let first = sort (closure n [0]) in
+  explore n ends letters [first] (M.insert (key first) 0 M.empty) [] []
+
+-- One state of the machine at a time, adding whatever it leads to.
+fun explore n ends letters todo seen moves accepts =
+  match V.toList todo with
+  | Nil -> ODfa moves accepts
+  | Cons states rest ->
+      let (rows, todo1, seen1) =
+        V.foldl
+        (\acc letter ->
+          match acc with
+          | (rs, queue, known) ->
+              match letter with
+              | (lo, hi) ->
+                  let to = sort (closure n (step n states lo hi)) in
+                  if V.isEmpty to then acc
+                  else
+                    match M.lookup (key to) known with
+                    | Just id -> (V.pushBack rs (lo, hi, id), queue, known)
+                    | None ->
+                        let id = M.size known in
+                        (V.pushBack rs (lo, hi, id),
+                          V.pushBack queue to,
+                          M.insert (key to) id known))
+        ([], V.fromList rest, seen)
+        letters in
+        explore n ends letters todo1 seen1 (V.pushBack moves rows)
+        (V.pushBack accepts (accepting ends states))
+
+-- What a set of states accepts: the earliest token any of them ends, or -1.
+fun accepting ends states =
+  V.foldl
+    (\best e ->
+      match e with
+      | (state, id) ->
+          if V.elem state states and (best < 0 or id < best) then id else best)
+    (0 - 1)
+    ends
+
+-- A set of states, as text, so it can be looked up.
+fun key states = S.join "," (V.map show states)
+
+-- --- walking it ---------------------------------------------------------------
+
+-- Walk `input` from the start, answering what it accepts and how far it read.
+@pub fun oldLongest d input = oldLongestFrom d (oldBytesOf input) 0
+
+-- The same, from `at` in bytes already taken apart: what a scanner walking a
+-- whole input calls, once per token.
+@pub fun oldLongestFrom d bytes at = walk d bytes at 0 (0 - 1) at
+
+@pub fun oldBytesOf input = V.map toInt (V.fromArray (S.toBytes input))
+
+fun walk d bytes at state bestId bestEnd =
+  let accepts = V.getOr (0 - 1) (dfaAccepts d) state in
+  let (id, upto) = if accepts >= 0 then (accepts, at) else (bestId, bestEnd) in
+  match V.get bytes at with
+  | None -> (id, upto)
+  | Just b ->
+      match oldNext d state b with
+      | None -> (id, upto)
+      | Just to -> walk d bytes (at + 1) to id upto
+
+@pub fun oldNext d state b =
+  V.foldl
+    (\found m ->
+      match m with
+      | (lo, hi, to) -> if lo <= b and b <= hi then Just to else found)
+    None
+    (V.getOr [] (dfaMoves d) state)
+
+
+-- A token and where it was found, in bytes.
+-- A token and where it was found, as the engine before the optimisations had it.
+@pub data OldLexed a = OldLexed a Int Int
+
+@pub fun oldToken l = match l with | OldLexed t _ _ -> t
+
+
+-- Where a scan gave up, and on what.
+@pub data OldError = OldUnexpected Int
+
+
+-- `input` as tokens, or where it stopped making sense.
+--
+-- `skip` is the token numbers to drop -- whitespace, comments -- and `make`
+-- builds a token from its number and the text that matched it.
+@pub fun oldScan d skip make input =
+  oldScanning d skip make input (oldBytesOf input) 0 []
+
+fun oldScanning d skip make input bytes at sofar =
+  if at >= V.len bytes then Ok sofar
+  else
+    let (id, upto) = oldLongestFrom d bytes at in
+    -- A pattern that matches nothing at all would leave the scan where it is,
+    -- so it counts as no match: better an error than a loop.
+    if id < 0 or upto <= at then Err (OldUnexpected at)
+    else
+      let text = S.slice input at upto in
+      let kept = if V.elem id skip then sofar
+                 else V.pushBack sofar (OldLexed (make id text) at upto) in
+      oldScanning d skip make input bytes upto kept
+
