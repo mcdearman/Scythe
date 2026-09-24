@@ -161,9 +161,8 @@ def metaBytes = [40, 41, 91, 93, 123, 125, 46, 42, 43, 63, 124, 94, 36, 92, 45]
 --   which token it was as one `Int` (`packMatch`), so nothing is allocated
 --   until a token is actually built.
 --
--- Everything written is a top-level function with its arguments annotated
--- `Int`: a local `let rec` would be a closure called through its object on
--- every byte, and an unannotated number would be passed as any `Num`.
+-- Everything written has its arguments annotated: an unannotated number would
+-- be passed as any `Num`, and see `tables` for the tables.
 
 fun written name skips variants d =
   let t = "scythe${name}" in
@@ -185,7 +184,7 @@ ${S.join "\n" (V.map (\s -> stateFun t d slots packed s) (V.range 0 (dfaStates d
 fun ${t}Make (id : Int) (input : String) (at : Int) (upto : Int) =
   ${arms name variants (V.range 0 (V.len variants))}
 
-fun ${t}Go c l (input : String) (n : Int) (at : Int) sofar =
+fun ${t}Go ${tables packed} (input : String) (n : Int) (at : Int) sofar =
   if at >= n then scanned sofar
   else
     let r = ${t}S0 c l input n at 0 in
@@ -195,7 +194,7 @@ fun ${t}Go c l (input : String) (n : Int) (at : Int) sofar =
     else if id >= ${show (V.len variants)} then ${t}Go c l input n upto sofar
     else ${t}Go c l input n upto (pushToken sofar (${t}Make id input at upto) at upto)
 
-fun ${t}Fold f c l (input : String) (n : Int) (at : Int) acc =
+fun ${t}Fold f ${tables packed} (input : String) (n : Int) (at : Int) acc =
   if at >= n then scanned acc
   else
     let r = ${t}S0 c l input n at 0 in
@@ -214,6 +213,14 @@ fun ${t}Fold f c l (input : String) (n : Int) (at : Int) acc =
 @pub fun fold${name} f acc input =
   ${t}Fold f ${t}Classes ${t}Loops input (stringByteLength input) 0 acc
 "
+
+-- The tables every generated function takes, annotated: the class table is a
+-- string of bytes where the classes fit in one, and numbers where they do not.
+-- Written out rather than left to inference, because a state that never reads
+-- the class table would otherwise be generic in it, and every call to it an
+-- instantiation where one monomorphic function would do.
+fun tables packed =
+  if packed then "(c : String) (l : String)" else "(c : Array Int) (l : String)"
 
 -- The states with an edge back to themselves, numbered: each is given the bit
 -- `slot % 7` of loop table `slot / 7`. -1 for a state that does not loop.
@@ -268,7 +275,7 @@ fun stateFun t d slots packed s =
     then ${me} c l input n (i + 1) here
     else\n" in
       let klass = if packed then "toInt (stringByteAt c b)" else "arrayGet c b" in
-      "fun ${me} c l (input : String) (n : Int) (i : Int) (best : Int) : Int =
+      "fun ${me} ${tables packed} (input : String) (n : Int) (i : Int) (best : Int) : Int =
   let here = ${noted} in
   if i >= n then here
   else

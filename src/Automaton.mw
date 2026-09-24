@@ -520,11 +520,9 @@ fun columnKey trans wide states c =
 
 -- --- walking it ------------------------------------------------------------------
 --
--- Every loop here is a function of its own at the top level, taking everything
--- it reads as an argument. A loop written as a local `let rec` is a closure,
--- and a closure calling itself is a call through its object on every byte; a
--- top-level function calling itself in tail position is a jump, which the
--- native backend turns into the loop it is.
+-- Every loop here calls itself in tail position with its numbers annotated
+-- `Int`, which is a jump, and which the native backend turns into the loop it
+-- is.
 --
 -- And what a walk answers is one `Int`, not a pair: the end of the longest
 -- match and the token it was, packed as `stop * 65536 + token + 1` -- 0 when

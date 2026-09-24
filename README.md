@@ -117,48 +117,59 @@ What `src/Gen.mw` writes is logos's shape:
   never copied into an array; the text of a token is cut from it only for a
   token that is kept and carries its text, which is logos's `Lexer::slice`.
 
-Everything written is a top-level function with its numbers annotated `Int`.
-Both matter more than they look. A loop written as a local `let rec` is a
-closure, which calls itself through its object on every byte; a top-level
-function calling itself is a jump. And a number nothing pins down is passed as
-any `Num`, with its arithmetic looked up in a dictionary.
+Everything written has its numbers annotated `Int`, and its tables annotated
+too. A number nothing pins down is passed as any `Num`, with its arithmetic
+looked up in a dictionary; and a state that never reads the class table would
+otherwise be generic in it, and every call to it an instantiation.
 
 ## How fast
 
-`bench/run.sh` lexes the same 48 KB of calculator source with this library and
-with the Rust crate, the same way both times — best of several runs, since the
-work is deterministic and the spread is the machine's doing. Both agree the
-file holds 10,270 tokens, which is what makes the rows worth comparing. Meadow
-is built with `--release --runtime aot` (LLVM, `-O2`) against Rust's
-`--release`. On one Windows laptop:
+Expect, compiled with `--release --runtime aot`:
 
-| lexer                                            | best   | throughput |
-| ------------------------------------------------ | ------ | ---------- |
-| meadow, the first engine (`before` in the bench) | 173 ms | 0.3 MB/s   |
-| meadow, the table walk this replaced             | 164 ms | 0.3 MB/s   |
-| meadow, `lexToken`                               | 2.8 ms | 18 MB/s    |
-| meadow, `lexKind` (no token carries text)        | 2.4 ms | 20 MB/s    |
-| meadow, `foldToken`                              | 1.0 ms | 48 MB/s    |
-| meadow, `foldKind`                               | 794 µs | 62 MB/s    |
-| rust logos                                       | 76 µs  | 645 MB/s   |
-| rust logos, borrowing each token's text          | 79 µs  | 618 MB/s   |
-| rust logos, building an owned `String` per token | 175 µs | 282 MB/s   |
+| what you call                     | throughput   |
+| --------------------------------- | ------------ |
+| `foldKind` — kinds, iterated      | **~60 MB/s** |
+| `foldToken` — with their text     | ~44 MB/s     |
+| `lexKind` — collected             | ~43 MB/s     |
+| `lexToken` — collected, with text | ~35 MB/s     |
 
-So the code generation is worth about **200×** over the table walk. What is
-left is about **10×** behind logos doing the same work (`foldKind` against
-`logos`), and about **6×** behind it on the like-for-like row with text
-(`foldToken` against the owned `String`, since a Meadow token that carries its
-text carries a string of its own).
+and on the default runtime (`meadow run --release`), about **25 MB/s**
+iterating and 12 MB/s collecting.
 
-The rest of the distance is the compiler's, not the lexer's. A call that is
-not in tail position costs about 10 ns in native Meadow code, and a scan makes
-three of them for each token. Collecting the tokens costs about 230 ns more
-each, which is persistent-vector `pushBack`, and that is why the `fold` rows
-are more than twice as fast as the `lex` rows.
+Those are `bench/`'s numbers. `bench/run.sh` lexes the same 48 KB of
+calculator source with this library and with the Rust crate, the same way both
+times — best of several runs, since the work is deterministic and the spread is
+the machine's doing. Both agree the file holds 10,270 tokens, which is what
+makes the rows worth comparing. Meadow is built with `--release --runtime aot`
+(LLVM, `-O2`) against Rust's `--release`. On one Windows laptop:
 
-On the default runtime (`meadow run --release`, no `--runtime aot`) the same
-machine takes 4.1 ms for `lexToken` and 2.0 ms for `foldKind`, where the table
-walk took 20 ms.
+| lexer                                            | best    | throughput |
+| ------------------------------------------------ | ------- | ---------- |
+| meadow, the first engine (`before` in the bench) | 38.5 ms | 1.3 MB/s   |
+| meadow, `lexToken`                               | 1.4 ms  | 35 MB/s    |
+| meadow, `lexKind` (no token carries text)        | 1.1 ms  | 43 MB/s    |
+| meadow, `foldToken`                              | 1.1 ms  | 44 MB/s    |
+| meadow, `foldKind`                               | 810 µs  | 61 MB/s    |
+| rust logos                                       | 76 µs   | 645 MB/s   |
+| rust logos, borrowing each token's text          | 79 µs   | 618 MB/s   |
+| rust logos, building an owned `String` per token | 175 µs  | 282 MB/s   |
+
+`foldKind` against `logos` is the like-for-like pair — both iterate, neither
+keeps a token — and it is about **10×** behind. With text, `foldToken` against
+logos building an owned `String` is about **6×** behind, since a Meadow token
+that carries its text carries a string of its own.
+
+What is left is per token, not per byte: the state functions walk a byte in a
+couple of loads and a jump, but each token costs three calls that are not in
+tail position -- into the machine, into the constructor, into your function --
+and a native Meadow call costs a few nanoseconds more than a Rust one.
+
+How it got here. The table walk this replaced took 164 ms on the same file,
+built by the same compiler as it was then: the code generation above took that
+to 2.8 ms, and fixes to the compiler it exposed took it to 1.4 ms -- local
+loops lifted to the top level, `match` on literals and on every constructor
+compiled without failure objects, a branch's context given a join point rather
+than a closure, and an array grown in place when nothing else holds it.
 
 ## Example
 
