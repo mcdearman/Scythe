@@ -14,10 +14,10 @@
 
 mod Baseline
 
-use Logos (lexer!, token, errorAt)
+use Scythe (lexer!, token, errorAt)
 use LogosBench.Baseline (oldCompile, oldScan)
-use Logos.Regex (parse)
-use Logos.Regex.Re.*
+use Scythe.Regex (parse)
+use Scythe.Regex.Re.*
 use Std.Time (monotonic)
 use Std.Collections.Vector as V
 use Std.String as S

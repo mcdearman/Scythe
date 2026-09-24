@@ -3,4 +3,4 @@ name = "LogosBench"
 version = "0.1.0"
 
 [dependencies]
-Logos = { path = ".." }
+Scythe = { path = ".." }

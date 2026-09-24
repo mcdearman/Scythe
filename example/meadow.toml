@@ -3,4 +3,4 @@ name = "Calc"
 version = "0.1.0"
 
 [dependencies]
-Logos = { path = ".." }
+Scythe = { path = ".." }

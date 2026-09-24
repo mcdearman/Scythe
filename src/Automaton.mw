@@ -48,8 +48,8 @@ use Std.Collections.HashMap as M
 use Std.String as S
 use Std.Maybe.Maybe.*
 use Std.Sort (sort, sortBy)
-use Logos.Regex (Re)
-use Logos.Regex.Re.*
+use Scythe.Regex (Re)
+use Scythe.Regex.Re.*
 
 -- A nondeterministic automaton: for each state, the byte ranges it moves on
 -- and the states it reaches without reading anything.
@@ -553,7 +553,7 @@ fun columnKey trans wide states c =
 -- --- tests -------------------------------------------------------------------
 
 use Std.Test (assertEq, assertTrue)
-use Logos.Regex (parse)
+use Scythe.Regex (parse)
 
 fun dfaOf patterns =
   compile (V.map (\p -> match p with | (id, text) ->

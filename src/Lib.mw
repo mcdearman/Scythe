@@ -5,11 +5,11 @@ mod Automaton
 mod Scan
 mod Gen
 
-@pub use Logos.Regex (parse)
-@pub use Logos.Automaton (
+@pub use Scythe.Regex (parse)
+@pub use Scythe.Automaton (
   readInts,
   Dfa, compile, longest, longestFrom, next, bytesOf,
   dfaClassOf, dfaTrans, dfaAccepts, dfaClasses, dfaStates,
 )
-@pub use Logos.Scan (Lexed, Error, scan, token, start, stop, errorAt)
-@pub use Logos.Gen (lexer)
+@pub use Scythe.Scan (Lexed, Error, scan, token, start, stop, errorAt)
+@pub use Scythe.Gen (lexer)

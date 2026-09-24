@@ -1,9 +1,9 @@
-# logos
+# scythe
 
 A lexer written for you, from the tokens you declare.
 
 ```meadow
-use Logos (lexer!, token)
+use Scythe (lexer!, token)
 
 @derive(Lexer)
 @skip("[ \t\r\n]+")

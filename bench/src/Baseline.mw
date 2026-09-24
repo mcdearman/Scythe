@@ -4,7 +4,7 @@
 -- This is the original engine, verbatim except for its name: the subset
 -- construction with no pruning and no merging, a table of byte ranges per
 -- state searched linearly on every byte, and an input turned into a persistent
--- vector so that reading one byte walks a tree. `Logos.Automaton` is what it
+-- vector so that reading one byte walks a tree. `Scythe.Automaton` is what it
 -- became; `bench` runs the two over the same bytes.
 
 use Std.Collections.Vector as V
@@ -13,8 +13,8 @@ use Std.String as S
 use Std.Maybe.Maybe.*
 use Std.Result.Result.*
 use Std.Sort (sort, sortBy)
-use Logos.Regex (Re, parse)
-use Logos.Regex.Re.*
+use Scythe.Regex (Re, parse)
+use Scythe.Regex.Re.*
 use OldLexed.*
 use OldError.*
 

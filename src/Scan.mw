@@ -20,7 +20,7 @@ use Std.Collections.Vector as V
 use Std.String as S
 use Std.Maybe.Maybe.*
 use Std.Result.Result.*
-use Logos.Automaton (Dfa, longestFrom, bytesOf)
+use Scythe.Automaton (Dfa, longestFrom, bytesOf)
 use Lexed.*
 use Error.*
 
@@ -67,9 +67,9 @@ fun skipped skip id =
 -- --- tests -------------------------------------------------------------------
 
 use Std.Test (assertEq, assertTrue)
-use Logos.Automaton (compile)
-use Logos.Regex (parse)
-use Logos.Regex.Re.*
+use Scythe.Automaton (compile)
+use Scythe.Regex (parse)
+use Scythe.Regex.Re.*
 
 fun table patterns =
   compile (V.map (\p -> match p with | (id, text) ->

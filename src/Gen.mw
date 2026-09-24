@@ -25,8 +25,8 @@ use Std.Collections.Vector as V
 use Std.String as S
 use Std.Maybe.Maybe.*
 use Std.Result.Result.*
-use Logos.Regex (parse)
-use Logos.Automaton (compile, dfaClassOf, dfaTrans, dfaAccepts, dfaClasses, dfaStates)
+use Scythe.Regex (parse)
+use Scythe.Automaton (compile, dfaClassOf, dfaTrans, dfaAccepts, dfaClasses, dfaStates)
 
 @macro
 @pub fun lexer ts =
@@ -147,7 +147,7 @@ fun written name skips variants d =
   -- Each array is given a name of its own rather than being written inside the
   -- `Dfa`: a literal is a register apiece while the block that builds it runs,
   -- and three of them in one expression is more than the allocator will take.
-  "use Logos (Dfa, scan, readInts)
+  "use Scythe (Dfa, scan, readInts)
 
 -- A byte's class. Bytes no pattern tells apart share one, so this is the only
 -- 256-wide thing a lexer carries.
