@@ -16,8 +16,8 @@
 -- --- what logos does, and what is done here -----------------------------------
 --
 -- The subset construction answers a *correct* machine, not a small or a quick
--- one. logos puts four passes between that machine and the code it emits, and
--- all four are here:
+-- one. logos puts passes between that machine and the code it emits, and
+-- these are the ones done here:
 --
 -- * **dead ends are pruned.** A state that cannot reach an accepting state can
 --   only ever end in a backtrack, so logos walks the graph backwards from the
@@ -31,17 +31,13 @@
 -- * **the alphabet is cut to byte classes.** logos carries a `ByteClass` per
 --   edge rather than 256 separate cases; two bytes no pattern tells apart cost
 --   one column between them, not two.
--- * **dispatch is a lookup, not a search.** logos emits `TABLE[byte as usize]`
---   for any state with more than two outgoing edges. The table here is the same
---   idea laid out flat: `trans[state * classes + classOf[byte]]`, two indexed
---   reads and no comparison chain.
 --
--- The one place this parts company with logos is *where* the width goes. logos
--- emits a full 256-entry table per state, which costs a Rust `const` nothing.
--- Emitting that many integers as Meadow source is what costs here, so the
--- classes stay folded: `classOf` is the only 256-wide array, and the transition
--- table is states by classes. Equivalent columns are merged too, so a table
--- narrows to the distinctions the patterns actually draw.
+-- What comes out is a table: `trans[state * classes + classOf[byte]]`. A
+-- derive does not run on it; it writes it out as a function per state, which
+-- is `Gen.mw`'s business. The table is walked directly only by `scan`, for a
+-- machine compiled at run time. Classes stay folded in it, so `classOf` is the
+-- only 256-wide thing, and equivalent columns are merged, so a table narrows to
+-- the distinctions the patterns actually draw.
 
 use Std.Collections.Vector as V
 use Std.Collections.HashMap as M
@@ -98,9 +94,17 @@ use Scythe.Regex.Re.*
       if b == 44 then go (i + 1) (V.pushBack out (signed cur neg)) 0 False False
       else if b == 45 then go (i + 1) out cur True any
       else go (i + 1) out (cur * 10 + (b - 48)) neg True in
-  V.toArray (go 0 [] 0 False False)
+      V.toArray (go 0 [] 0 False False)
 
 fun signed cur neg = if neg then 0 - cur else cur
+
+-- The numbers in `s` as the bytes of a string: a table packed one byte to an
+-- entry, where `readInts` spends a word on each. Read with `stringByteAt`,
+-- which is one load.
+--
+-- Every number has to be below 128. A string is UTF-8, and a byte above that
+-- on its own is not, so it would not survive the trip.
+@pub fun packBytes s = S.fromBytes (V.toArray (V.map toUInt8 (V.fromArray (readInts s))))
 
 -- "there is no such state", in a transition table and in an accept table.
 @pub def none = 0 - 1
@@ -172,6 +176,15 @@ fun gaps ranges at sofar =
           gaps (V.fromList rest) (if hi + 1 > at then hi + 1 else at) kept
 
 -- --- making it deterministic ---------------------------------------------------
+--
+-- This runs inside the compiler, under the step budget a macro is given, so it
+-- is written to do each piece of work once. Three things are worked out before
+-- the construction starts rather than inside it: every state's closure over the
+-- edges that read nothing, which letter each byte falls in, and what each state
+-- accepts. With those, one state of the machine is made in a single pass over
+-- the edges of the states in it -- each edge drops its target into the letters
+-- it covers -- where asking every letter in turn about every edge was the
+-- product of the two.
 
 -- The states reachable from `states` without reading anything, themselves
 -- included.
@@ -185,21 +198,18 @@ fun closureOf n todo seen =
       let unseen = V.filter (\t -> not (V.elem t seen)) next in
       closureOf n (V.toList (V.append (V.fromList rest) unseen)) (V.append seen unseen)
 
--- Where `states` go on reading a byte in `lo..hi`.
-fun step n states lo hi =
+-- Every state's own closure, sorted.
+fun closures n = V.map (\s -> sort (closure n [s])) (V.range 0 (V.len (nfaEps n)))
+
+-- The closure of a set of states: the union of theirs, sorted, each once.
+fun closeAll eclose states = uniq (sort (V.concatMap (\s -> V.getOr [] eclose s) states))
+
+-- A sorted vector with its repeats taken out.
+fun uniq v =
   V.foldl
-    (\acc s ->
-      V.foldl
-        (\inner m ->
-          match m with
-          | (mlo, mhi, to) ->
-              if mlo <= lo and hi <= mhi and not (V.elem to inner) then
-                V.pushBack inner to
-              else inner)
-        acc
-        (V.getOr [] (nfaMoves n) s))
+    (\acc x -> match V.last acc with | Just y -> if x == y then acc else V.pushBack acc x | None -> V.pushBack acc x)
     []
-    states
+    v
 
 -- Every byte where a range begins or ends: the alphabet, in as few pieces as
 -- the patterns can tell apart.
@@ -218,10 +228,7 @@ fun lettersOf rows =
       [0]
       rows in
     let points = sort (V.filter (\p -> p <= 255) edges) in
-    intervals (dedup points) []
-
-fun dedup v =
-  V.foldl (\acc x -> if V.elem x acc then acc else V.pushBack acc x) [] v
+    intervals (uniq points) []
 
 fun intervals points sofar =
   match V.toList points with
@@ -229,6 +236,14 @@ fun intervals points sofar =
   | Cons p rest ->
       let hi = match rest with | Nil -> 255 | Cons q _ -> q - 1 in
       intervals (V.fromList rest) (if p <= hi then V.pushBack sofar (p, hi) else sofar)
+
+-- Which letter each byte is in. The letters cut 0..255 at every boundary an
+-- edge has, so an edge's range is exactly the letters from its first byte's to
+-- its last byte's.
+fun letterIndex letters =
+  V.concatMap
+    (\i -> match V.getOr (0, 0) letters i with | (lo, hi) -> V.replicate (hi - lo + 1) i)
+    (V.range 0 (V.len letters))
 
 -- The machine `patterns` make, with each state saying which token it accepts.
 --
@@ -257,24 +272,42 @@ fun intervals points sofar =
 
 fun subset n ends =
   let letters = alphabet n in
-  let first = sort (closure n [0]) in
-  explore n ends letters [first] (M.insert (key first) 0 M.empty) [] []
+  let eclose = closures n in
+  let first = V.getOr [] eclose 0 in
+  let ctx = (nfaMoves n, eclose, letterIndex letters, letters, acceptsOf n ends) in
+  explore ctx [first] (M.insert (key first) 0 M.empty) [] []
+
+-- What each state of the nondeterministic machine accepts: the earliest token
+-- that ends there, or -1.
+fun acceptsOf n ends =
+  V.foldl
+    (\acc e ->
+      match e with
+      | (state, id) ->
+          let was = V.getOr none acc state in
+          if was < 0 or id < was then V.set acc state id else acc)
+    (V.replicate (V.len (nfaEps n)) none)
+    ends
 
 -- One state of the machine at a time, adding whatever it leads to.
-fun explore n ends letters todo seen moves accepts =
+fun explore ctx todo seen moves accepts =
   match V.toList todo with
   | Nil -> (moves, accepts)
   | Cons states rest ->
-      let (rows, todo1, seen1) =
-        V.foldl
-        (\acc letter ->
-          match acc with
-          | (rs, queue, known) ->
-              match letter with
-              | (lo, hi) ->
-                  let to = sort (closure n (step n states lo hi)) in
-                  if V.isEmpty to then acc
+      match ctx with
+      | (nmoves, eclose, letterOf, letters, acc) ->
+          let buckets = targets nmoves letterOf (V.len letters) states in
+          let (rows, todo1, seen1) =
+            V.foldl
+            (\acc0 i ->
+              match acc0 with
+              | (rs, queue, known) ->
+                  let hit = V.getOr [] buckets i in
+                  if V.isEmpty hit then acc0
                   else
+                    let to = closeAll eclose hit in
+                    let lo = match V.getOr (0, 0) letters i with | (l, _) -> l in
+                    let hi = match V.getOr (0, 0) letters i with | (_, h) -> h in
                     match M.lookup (key to) known with
                     | Just id -> (V.pushBack rs (lo, hi, id), queue, known)
                     | None ->
@@ -282,20 +315,36 @@ fun explore n ends letters todo seen moves accepts =
                         (V.pushBack rs (lo, hi, id),
                           V.pushBack queue to,
                           M.insert (key to) id known))
-        ([], V.fromList rest, seen)
-        letters in
-        explore n ends letters todo1 seen1 (V.pushBack moves rows)
-        (V.pushBack accepts (accepting ends states))
+            ([], V.fromList rest, seen)
+            (V.range 0 (V.len letters)) in
+            explore ctx todo1 seen1 (V.pushBack moves rows) (V.pushBack accepts (accepting acc states))
+
+-- For each letter, the states `states` move to on it: every edge of every
+-- state, dropped into the letters its range covers.
+fun targets nmoves letterOf wide states =
+  V.foldl
+    (\acc s ->
+      V.foldl
+        (\inner m ->
+          match m with
+          | (lo, hi, to) ->
+              V.foldl
+                (\b i -> V.updateAt b i (\ts -> V.pushBack ts to))
+                inner
+                (V.range (V.getOr 0 letterOf lo) (V.getOr 0 letterOf hi + 1)))
+        acc
+        (V.getOr [] nmoves s))
+    (V.replicate wide [])
+    states
 
 -- What a set of states accepts: the earliest token any of them ends, or -1.
-fun accepting ends states =
+fun accepting acc states =
   V.foldl
-    (\best e ->
-      match e with
-      | (state, id) ->
-          if V.elem state states and (best < 0 or id < best) then id else best)
+    (\best s ->
+      let id = V.getOr none acc s in
+      if id >= 0 and (best < 0 or id < best) then id else best)
     none
-    ends
+    states
 
 -- A set of states, as text, so it can be looked up.
 fun key states = S.join "," (V.map show states)
@@ -323,7 +372,7 @@ fun liveFix moves live =
         or V.any (\m -> match m with | (_, _, to) -> V.getOr False live to)
             (V.getOr [] moves i))
       (V.range 0 (V.len live)) in
-  if countTrue next == countTrue live then next else liveFix moves next
+    if countTrue next == countTrue live then next else liveFix moves next
 
 fun countTrue v = V.foldl (\acc b -> if b then acc + 1 else acc) 0 v
 
@@ -349,7 +398,7 @@ fun renumber live =
   match
     V.foldl
       (\acc b -> match acc with | (ids, next) ->
-        if b then (V.pushBack ids next, next + 1) else (V.pushBack ids none, next))
+          if b then (V.pushBack ids next, next + 1) else (V.pushBack ids none, next))
       ([], 0)
       live
   with
@@ -372,9 +421,9 @@ fun minimize moves accepts =
       V.map
         (\row -> V.map (\m -> match m with | (lo, hi, to) -> (lo, hi, V.getOr 0 canon to)) row)
         moves in
-    let live = V.map (\i -> V.getOr 0 canon i == i) (V.range 0 (V.len accepts)) in
-    let (moves1, accepts1) = keepStates rewritten accepts live in
-    minimize moves1 accepts1
+      let live = V.map (\i -> V.getOr 0 canon i == i) (V.range 0 (V.len accepts)) in
+      let (moves1, accepts1) = keepStates rewritten accepts live in
+      minimize moves1 accepts1
 
 -- For each state, the first state it is indistinguishable from.
 fun canonical moves accepts =
@@ -405,47 +454,28 @@ fun showMove m = match m with | (lo, hi, to) -> "${show lo}-${show hi}>${show to
 fun tabulate moves accepts =
   let letters = lettersOf moves in
   let wide = V.len letters in
-  let classOf = classTable letters in
-  let trans = transTable moves letters wide in
+  let classOf = letterIndex letters in
+  let trans = transTable moves classOf wide in
   let (classOf1, trans1, narrow) = mergeClasses classOf trans wide (V.len accepts) in
   Dfa (V.toArray classOf1) (V.toArray trans1) (V.toArray accepts) narrow
 
--- Each byte's class: which of the letters it falls in.
-fun classTable letters =
-  V.map
-    (\b ->
-      match
-        V.foldl
-          (\found i ->
-            match V.getOr (0, 0) letters i with
-            | (lo, hi) -> if found < 0 and lo <= b and b <= hi then i else found)
-          none
-          (V.range 0 (V.len letters))
-      with
-      | c -> if c < 0 then 0 else c)
-    (V.range 0 256)
-
--- `states` by `wide`, read as `trans[state * wide + class]`.
-fun transTable moves letters wide =
-  V.foldl
-    (\acc s ->
+-- `states` by `wide`, read as `trans[state * wide + class]`: each state's row
+-- starts empty and each of its edges fills in the letters it covers. The edges
+-- of one state never overlap, so the order they are laid down in is no matter.
+fun transTable moves classOf wide =
+  V.concatMap
+    (\row ->
       V.foldl
-        (\row c ->
-          match V.getOr (0, 0) letters c with
-          | (lo, hi) -> V.pushBack row (target (V.getOr [] moves s) lo hi))
-        acc
-        (V.range 0 wide))
-    []
-    (V.range 0 (V.len moves))
-
--- Where a row sends the letter `lo..hi`, or -1 where it sends it nowhere.
-fun target row lo hi =
-  V.foldl
-    (\found m ->
-      match m with
-      | (mlo, mhi, to) -> if found < 0 and mlo <= lo and hi <= mhi then to else found)
-    none
-    row
+        (\cells m ->
+          match m with
+          | (lo, hi, to) ->
+              V.foldl
+                (\cs i -> V.set cs i to)
+                cells
+                (V.range (V.getOr 0 classOf lo) (V.getOr 0 classOf hi + 1)))
+        (V.replicate wide none)
+        row)
+    moves
 
 -- Two classes that every state treats alike are one class. This is logos's
 -- `ByteClass::merge` seen from the table's side: it takes columns out of the
@@ -455,17 +485,11 @@ fun mergeClasses classOf trans wide states =
   let narrow = 1 + V.foldl (\m c -> if c > m then c else m) 0 ids in
   if narrow == wide then (classOf, trans, wide)
   else
+    -- The first old class that was given each new number stands for it.
+    let firsts = V.map (\c -> firstWith ids c) (V.range 0 narrow) in
     (V.map (\c -> V.getOr 0 ids c) classOf,
-      V.foldl
-        (\acc s ->
-          V.foldl
-            (\row c ->
-              -- The first old class that was given this new number stands for it.
-              match firstWith ids c with
-              | old -> V.pushBack row (V.getOr none trans (s * wide + old)))
-            acc
-            (V.range 0 narrow))
-        []
+      V.concatMap
+        (\s -> V.map (\old -> V.getOr none trans (s * wide + old)) firsts)
         (V.range 0 states),
       narrow)
 
@@ -495,53 +519,64 @@ fun columnKey trans wide states c =
   S.join "," (V.map (\s -> show (V.getOr none trans (s * wide + c))) (V.range 0 states))
 
 -- --- walking it ------------------------------------------------------------------
+--
+-- Every loop here is a function of its own at the top level, taking everything
+-- it reads as an argument. A loop written as a local `let rec` is a closure,
+-- and a closure calling itself is a call through its object on every byte; a
+-- top-level function calling itself in tail position is a jump, which the
+-- native backend turns into the loop it is.
+--
+-- And what a walk answers is one `Int`, not a pair: the end of the longest
+-- match and the token it was, packed as `stop * 65536 + token + 1` -- 0 when
+-- nothing matched. A pair would be an allocation per token for the scanner to
+-- take apart again straight away.
 
 @pub fun bytesOf input = S.toBytes input
+
+-- A match packed into one word: where it ended and what it was.
+@pub fun packMatch (stop : Int) (id : Int) : Int = stop * 65536 + id + 1
+
+-- The token a packed match was, or -1 for no match.
+@pub fun matchId (r : Int) : Int = r % 65536 - 1
+
+-- Where a packed match ended.
+@pub fun matchEnd (r : Int) : Int = r / 65536
 
 -- Walk `input` from the start, answering what it accepts and how far it read.
 @pub fun longest d input = longestFrom d (bytesOf input) 0
 
--- The same, from `at` in bytes already taken apart: what a scanner walking a
--- whole input calls, once per token.
---
--- The table is pulled out of the `Dfa` once and then read directly, and the
--- loop below carries only what changes -- the state, where it is, and the best
--- match so far. Everything it touches per byte is an array read.
+-- The same, from `at` in bytes already taken apart, as a pair: the token, or -1,
+-- and where it ended.
 @pub fun longestFrom d bytes at =
+  let r = match d with | Dfa classOf trans accepts wide -> walkBytes classOf trans accepts wide bytes (arrayLen bytes) 0 at 0 in
+  if r == 0 then (none, at) else (matchId r, matchEnd r)
+
+-- The longest match in `input` from byte `at`, packed: what a scanner calls,
+-- once per token. The string is read where it is, a byte at a time, rather
+-- than being taken apart into an array first.
+@pub fun matchFrom d (input : String) (at : Int) : Int =
   match d with
   | Dfa classOf trans accepts wide ->
-      let n = arrayLen bytes in
-      -- logos's fast loop: a state whose edge points back at itself is a run --
-      -- an identifier, a number, a stretch of spaces -- and a run is read
-      -- without asking anything that cannot have changed. What the state accepts
-      -- is the same at every byte of it, so it is looked at once, at the end,
-      -- rather than at each.
-      let rec spin state i =
-        if i >= n then i
-        else if arrayGet trans (state * wide + arrayGet classOf (toInt (arrayGet bytes i))) == state
-        then spin state (i + 1)
-        else i in
-      let rec walk state i bestId bestEnd =
-        -- The accept is read on entering a state, so a state is charged for it
-        -- once however many bytes it goes on to read.
-        let acc = arrayGet accepts state in
-        let bi = if acc >= 0 then acc else bestId in
-        let be = if acc >= 0 then i else bestEnd in
-        if i >= n then (bi, be)
-        else
-          let to = arrayGet trans (state * wide + arrayGet classOf (toInt (arrayGet bytes i))) in
-          if to < 0 then (bi, be)
-          else if to == state then
-            let stop = spin state (i + 1) in
-            let bi1 = if acc >= 0 then acc else bi in
-            let be1 = if acc >= 0 then stop else be in
-            if stop >= n then (bi1, be1)
-            else
-              let to1 = arrayGet trans (state * wide + arrayGet classOf (toInt (arrayGet bytes stop))) in
-              if to1 < 0 then (bi1, be1)
-              else walk to1 (stop + 1) bi1 be1
-          else walk to (i + 1) bi be in
-      walk 0 at none at
+      walk classOf trans accepts wide input (stringByteLength input) 0 at 0
+
+-- One state of the walk. The accept is read on entering a state, so the best
+-- match so far is always the last accepting state passed through.
+fun walk classOf trans accepts (wide : Int) (input : String) (n : Int) (state : Int) (i : Int) (best : Int) : Int =
+  let acc = arrayGet accepts state in
+  let best1 = if acc >= 0 then packMatch i acc else best in
+  if i >= n then best1
+  else
+    let to = arrayGet trans (state * wide + arrayGet classOf (toInt (stringByteAt input i))) in
+    if to < 0 then best1 else walk classOf trans accepts wide input n to (i + 1) best1
+
+-- The same over bytes already in an array.
+fun walkBytes classOf trans accepts (wide : Int) bytes (n : Int) (state : Int) (i : Int) (best : Int) : Int =
+  let acc = arrayGet accepts state in
+  let best1 = if acc >= 0 then packMatch i acc else best in
+  if i >= n then best1
+  else
+    let to = arrayGet trans (state * wide + arrayGet classOf (toInt (arrayGet bytes i))) in
+    if to < 0 then best1 else walkBytes classOf trans accepts wide bytes n to (i + 1) best1
 
 -- Where `state` goes on reading `b`, or nothing.
 @pub fun next d state b =
@@ -624,7 +659,7 @@ fun dfaOf patterns =
   assertEq (arrayLen (dfaTrans d)) (dfaStates d * dfaClasses d) "states by classes"
 
 @test fun aRunIsReadByTheFastLoop () =
-  -- The self-edge that `spin` follows: many bytes, one state, one answer.
+  -- A self-edge: many bytes, one state, one answer.
   let d = dfaOf [(0, "[a-z]+")] in
   assertEq (longest d "abcdefghijklmnopqrstuvwxyz!") (0, 26) "all of the letters"
 
@@ -649,5 +684,5 @@ fun dfaOf patterns =
         (readInts (S.join "," (V.map show (V.fromArray (dfaTrans d)))))
         (readInts (S.join "," (V.map show (V.fromArray (dfaAccepts d)))))
         (dfaClasses d) in
-  let a = assertEq (longest rebuilt "let") (longest d "let") "the keyword" in
-  assertEq (longest rebuilt "letter") (longest d "letter") "and the identifier"
+    let a = assertEq (longest rebuilt "let") (longest d "let") "the keyword" in
+    assertEq (longest rebuilt "letter") (longest d "letter") "and the identifier"

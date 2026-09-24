@@ -1,4 +1,4 @@
--- logos: a lexer written for you, from the tokens you declare.
+-- Scythe: a lexer written for you, from the tokens you declare.
 
 mod Regex
 mod Automaton
@@ -8,8 +8,12 @@ mod Gen
 @pub use Scythe.Regex (parse)
 @pub use Scythe.Automaton (
   readInts,
-  Dfa, compile, longest, longestFrom, next, bytesOf,
+  Dfa, compile, longest, longestFrom, matchFrom, packMatch, matchId, matchEnd, next, bytesOf,
+  packBytes,
   dfaClassOf, dfaTrans, dfaAccepts, dfaClasses, dfaStates,
 )
-@pub use Scythe.Scan (Lexed, Error, scan, token, start, stop, errorAt)
+@pub use Scythe.Scan (
+  Lexed, Error, scan, foldScan, token, start, stop, errorAt,
+  noTokens, pushToken, scanned, stuckAt,
+)
 @pub use Scythe.Gen (lexer)

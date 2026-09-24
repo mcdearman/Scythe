@@ -1,13 +1,17 @@
--- What the optimisations were worth, over the same bytes twice.
+-- What the optimisations were worth, over the same bytes each time.
 --
--- `meadow run --release` here lexes `corpus.calc` with three lexers and reports
--- how many bytes a second each gets through:
+-- `meadow run --release --runtime aot` here lexes `corpus.calc` five ways and
+-- reports how many bytes a second each gets through:
 --
 --   * **before** -- the engine as it was, kept in `Baseline.mw`;
---   * **after** -- the same grammar through `@derive(Lexer)` as it now stands;
+--   * **after** -- the same grammar through `@derive(Lexer)`, collecting the
+--     tokens into a vector with `lexToken`;
 --   * **after, kinds only** -- the same again from a declaration whose variants
---     carry no text, which is what Rust's logos does by default and so what the
---     numbers in `bench/rust` should be read against.
+--     carry no text;
+--   * **fold** and **fold, kinds only** -- the same two, but counting the
+--     tokens as they come with `foldToken` / `foldKind` rather than collecting
+--     them. That is what `bench/rust` does with logos's iterator, so these are
+--     the rows to read its numbers against.
 --
 -- The grammar is written out three times over, and it is the same grammar each
 -- time: `bench/rust/src/main.rs` writes it a fourth time, for logos.
@@ -66,14 +70,14 @@ data Kind
 -- is skipped, which is what the derive does too.
 def oldPatterns =
   [ "\\+", "\\-", "\\*", "/", "=", "\\(", "\\)", "let"
-  , "[0-9]+(\\.[0-9]+)?", "[a-zA-Z_][a-zA-Z0-9_]*"
-  , "[ \t\r\n]+", "\\-\\-[^\n]*" ]
+    , "[0-9]+(\\.[0-9]+)?", "[a-zA-Z_][a-zA-Z0-9_]*"
+    , "[ \t\r\n]+", "\\-\\-[^\n]*" ]
 
 def oldTable =
   oldCompile
     (V.map
       (\p -> match p with | (i, text) ->
-        (i, match parse text with | Ok re -> re | Err _ -> Empty))
+          (i, match parse text with | Ok re -> re | Err _ -> Empty))
       (V.zip (V.range 0 (V.len oldPatterns)) oldPatterns))
 
 def oldSkip = [10, 11]
@@ -96,6 +100,8 @@ fun corpus () = readToStringOr "" "corpus.calc"
 
 fun countOf r = match r with | Ok ts -> V.len ts | Err _ -> 0
 
+fun foldedOf r = match r with | Ok k -> k | Err _ -> 0
+
 -- The shortest time `act` took over `reps` runs, in nanoseconds.
 fun bestOf reps act =
   let rec go k best =
@@ -106,7 +112,7 @@ fun bestOf reps act =
       let t1 = monotonic () in
       let took = t1 - t0 in
       go (k - 1) (if best < 0 or took < best then took else best) in
-  go reps (0 - 1)
+      go reps (0 - 1)
 
 fun report name bytes nanos =
   let perSecond = bytes * 1000000000 / nanos in
@@ -132,4 +138,8 @@ def main =
     let _ = println "${pad 22 "lexer"}${pad 12 "best"}${pad 14 "throughput"}" in
     let _ = run "before" bytes 3 (\() -> countOf (oldLex text)) in
     let _ = run "after" bytes 5 (\() -> countOf (lexToken text)) in
-    run "after, kinds only" bytes 5 (\() -> countOf (lexKind text))
+    let _ = run "after, kinds only" bytes 5 (\() -> countOf (lexKind text)) in
+    -- The same tokens, counted as they come rather than collected: what the
+    -- Rust bench does with logos's iterator, and so the like-for-like row.
+    let _ = run "fold" bytes 20 (\() -> foldedOf (foldToken (\k t a b -> k + 1) 0 text)) in
+    run "fold, kinds only" bytes 20 (\() -> foldedOf (foldKind (\k t a b -> k + 1) 0 text))

@@ -3,8 +3,8 @@
 -- This is the macro -- `@macro` below is what says so. It runs while the
 -- package that wrote the declaration is
 -- compiled, so everything expensive -- parsing the patterns, building the
--- automaton -- happens once, there, and what is left for run time is a table
--- walk.
+-- automaton -- happens once, there, and what is left for run time is code
+-- written for this one machine: a function per state.
 --
 -- What it reads is the declaration as written, attributes and all:
 --
@@ -14,7 +14,8 @@
 --       = @token("+") Plus
 --       | @regex("[0-9]+") Number String
 --
--- and what it writes beside it is `lexToken : String -> Result Error [Lexed Token]`.
+-- and what it writes beside it is `lexToken : String -> Result Error [Lexed Token]`
+-- and `foldToken`, the same tokens one at a time.
 -- A variant with a `String` field is given the text that matched it; one with
 -- no fields is given nothing.
 
@@ -139,33 +140,163 @@ fun escaped b =
 def metaBytes = [40, 41, 91, 93, 123, 125, 46, 42, 43, 63, 124, 94, 36, 92, 45]
 
 -- --- writing the lexer ---------------------------------------------------------
+--
+-- What is written is logos's shape rather than a table and a loop over it:
+--
+-- * **a function per state.** State `s` is `scytheTokenS<s>`, which reads a
+--   byte and calls the state it moves to, in tail position -- so a move is a
+--   jump, and the machine is the program's control flow rather than data the
+--   program consults. Nothing is looked up to learn where to go next.
+-- * **a jump table per state.** Where a state goes is decided by the byte's
+--   class, as a chain of `k == …` tests on one `Int`, which LLVM turns into a
+--   `switch` -- and a dense `switch` into a jump table. Classes that go to the
+--   same state share one arm.
+-- * **one lookup table, packed.** A byte's class is one byte of a 256-byte
+--   string. A state with an edge back to itself -- an identifier, a number, a
+--   run of spaces -- is given one *bit* of a second table instead, which says
+--   of each byte whether the state stays put on it: logos's fast loop, and its
+--   trick of packing several of those tables into the bits of one. Seven to a
+--   byte here, since a string is UTF-8 and a byte above 127 would not survive.
+-- * **one word per match.** A state answers where the longest match ended and
+--   which token it was as one `Int` (`packMatch`), so nothing is allocated
+--   until a token is actually built.
+--
+-- Everything written is a top-level function with its arguments annotated
+-- `Int`: a local `let rec` would be a closure called through its object on
+-- every byte, and an unannotated number would be passed as any `Num`.
 
 fun written name skips variants d =
-  let ids = V.range 0 (V.len variants) in
-  let skipIds = V.map (\i -> V.len variants + i) (V.range 0 (V.len skips)) in
-  let t = lower name in
-  -- Each array is given a name of its own rather than being written inside the
-  -- `Dfa`: a literal is a register apiece while the block that builds it runs,
-  -- and three of them in one expression is more than the allocator will take.
-  "use Scythe (Dfa, scan, readInts)
+  let t = "scythe${name}" in
+  let wide = dfaClasses d in
+  let slots = loopSlots d in
+  let packed = wide < 128 in
+  let classes = if packed then "packBytes" else "readInts" in
+  "use Scythe (packBytes, readInts, noTokens, pushToken, scanned, stuckAt)
 
--- A byte's class. Bytes no pattern tells apart share one, so this is the only
--- 256-wide thing a lexer carries.
-def ${t}ClassOf = readInts \"${showArray (dfaClassOf d)}\"
+-- A byte's class: bytes no pattern tells apart share one.
+def ${t}Classes = ${classes} \"${showArray (dfaClassOf d)}\"
 
--- A state and a class to the next state, or -1 where there is none.
--- ${show (dfaStates d)} states by ${show (dfaClasses d)} classes.
-def ${t}Trans = readInts \"${showArray (dfaTrans d)}\"
+-- For each state that loops, one bit: whether it stays where it is on a byte.
+def ${t}Loops = packBytes \"${showIntArray (loopTable d slots)}\"
 
--- What each state accepts, or -1 for one that accepts nothing.
-def ${t}Accepts = readInts \"${showArray (dfaAccepts d)}\"
+-- ${show (dfaStates d)} states, ${show wide} classes.
+${S.join "\n" (V.map (\s -> stateFun t d slots packed s) (V.range 0 (dfaStates d)))}
+-- A token from its number and where it was.
+fun ${t}Make (id : Int) (input : String) (at : Int) (upto : Int) =
+  ${arms name variants (V.range 0 (V.len variants))}
 
-def ${t}Table = Dfa ${t}ClassOf ${t}Trans ${t}Accepts ${show (dfaClasses d)}
+fun ${t}Go c l (input : String) (n : Int) (at : Int) sofar =
+  if at >= n then scanned sofar
+  else
+    let r = ${t}S0 c l input n at 0 in
+    let id = r % 65536 - 1 in
+    let upto = r / 65536 in
+    if id < 0 or upto <= at then stuckAt at
+    else if id >= ${show (V.len variants)} then ${t}Go c l input n upto sofar
+    else ${t}Go c l input n upto (pushToken sofar (${t}Make id input at upto) at upto)
 
-def ${t}Skip = readInts \"${showIntArray skipIds}\"
+fun ${t}Fold f c l (input : String) (n : Int) (at : Int) acc =
+  if at >= n then scanned acc
+  else
+    let r = ${t}S0 c l input n at 0 in
+    let id = r % 65536 - 1 in
+    let upto = r / 65536 in
+    if id < 0 or upto <= at then stuckAt at
+    else if id >= ${show (V.len variants)} then ${t}Fold f c l input n upto acc
+    else ${t}Fold f c l input n upto (f acc (${t}Make id input at upto) at upto)
 
+-- Every token in `input`, or where it stopped making sense.
 @pub fun lex${name} input =
-  scan ${t}Table ${t}Skip (\\id text -> ${arms name variants ids}) input"
+  ${t}Go ${t}Classes ${t}Loops input (stringByteLength input) 0 noTokens
+
+-- The tokens one at a time, into `f acc token start stop`, keeping none of
+-- them: logos's `Lexer`, which is an iterator rather than a list.
+@pub fun fold${name} f acc input =
+  ${t}Fold f ${t}Classes ${t}Loops input (stringByteLength input) 0 acc
+"
+
+-- The states with an edge back to themselves, numbered: each is given the bit
+-- `slot % 7` of loop table `slot / 7`. -1 for a state that does not loop.
+fun loopSlots d =
+  let wide = dfaClasses d in
+  let trans = dfaTrans d in
+  V.foldl
+    (\acc s ->
+      match acc with
+      | (slots, next) ->
+          if loops trans wide s then (V.pushBack slots next, next + 1)
+          else (V.pushBack slots (0 - 1), next))
+    ([], 0)
+    (V.range 0 (dfaStates d))
+    |> fst
+
+fun loops trans wide s = V.any (\c -> arrayGet trans (s * wide + c) == s) (V.range 0 wide)
+
+-- The loop tables, 256 bytes each, one after another.
+fun loopTable d slots =
+  let used = V.foldl (\m x -> if x + 1 > m then x + 1 else m) 0 slots in
+  let tables = (used + 6) / 7 in
+  V.concatMap (\tbl -> V.map (\b -> loopByte d slots tbl b) (V.range 0 256)) (V.range 0 tables)
+
+-- Byte `b` of loop table `tbl`: a bit for each state in it that stays on `b`.
+fun loopByte d slots tbl b =
+  let wide = dfaClasses d in
+  let trans = dfaTrans d in
+  let cls = arrayGet (dfaClassOf d) b in
+  V.foldl
+    (\acc s ->
+      let slot = V.getOr (0 - 1) slots s in
+      if slot >= 0 and slot / 7 == tbl and arrayGet trans (s * wide + cls) == s
+      then acc + pow2 (slot % 7)
+      else acc)
+    0
+    (V.range 0 (V.len slots))
+
+fun pow2 k = if k <= 0 then 1 else 2 * pow2 (k - 1)
+
+-- State `s` as a function. It notes the match it makes, if it accepts; stays
+-- on its loop bytes, if it has any; and otherwise dispatches on the class.
+fun stateFun t d slots packed s =
+  let accept = arrayGet (dfaAccepts d) s in
+  let slot = V.getOr (0 - 1) slots s in
+  let me = "${t}S${show s}" in
+  let noted = if accept >= 0 then "i * 65536 + ${show (accept + 1)}" else "best" in
+  let loop =
+    if slot < 0 then ""
+    else
+      "    if bitAnd (toInt (stringByteAt l (${show (256 * (slot / 7))} + b))) ${show (pow2 (slot % 7))} != 0
+    then ${me} c l input n (i + 1) here
+    else\n" in
+      let klass = if packed then "toInt (stringByteAt c b)" else "arrayGet c b" in
+      "fun ${me} c l (input : String) (n : Int) (i : Int) (best : Int) : Int =
+  let here = ${noted} in
+  if i >= n then here
+  else
+    let b = toInt (stringByteAt input i) in
+${loop}${dispatch t d s klass}
+"
+
+-- Where `s` goes on each class but its own loop, grouped by where it goes.
+fun dispatch t d s klass =
+  let wide = dfaClasses d in
+  let trans = dfaTrans d in
+  let targets =
+    V.foldl
+      (\acc c ->
+        let to = arrayGet trans (s * wide + c) in
+        if to < 0 or to == s or V.elem to acc then acc else V.pushBack acc to)
+      []
+      (V.range 0 wide) in
+    if V.isEmpty targets then "    here"
+    else
+      let arms =
+        V.map
+        (\to ->
+          let cs = V.filter (\c -> arrayGet trans (s * wide + c) == to) (V.range 0 wide) in
+          let test = S.join " or " (V.map (\c -> "k == ${show c}") cs) in
+          "if ${test} then ${t}S${show to} c l input n (i + 1) here")
+        targets in
+        "    let k = ${klass} in\n    ${S.join "\n    else " arms}\n    else here"
 
 -- `if id == 0 then Type.Plus else …`, and a token that takes the text is given
 -- it. The last arm needs no test: the table answers with nothing else.
@@ -183,7 +314,7 @@ fun arms name variants ids =
 
 fun build name v =
   let ctor = ctorOf v in
-  if takesText v then "(${name}.${ctor} text)" else "${name}.${ctor}"
+  if takesText v then "(${name}.${ctor} (stringSlice input at upto))" else "${name}.${ctor}"
 
 -- The variant's name: the first word that is not an attribute's.
 fun ctorOf v =
@@ -235,6 +366,7 @@ fun showIntArray xs = S.join "," (V.map show xs)
 -- --- tests -------------------------------------------------------------------
 
 use Std.Test (assertEq, assertTrue)
+use Scythe.Regex.Re.*
 
 -- The declaration above, as the tokens a derive is given.
 fun declared () =
@@ -287,6 +419,29 @@ fun declared () =
       | Ok res ->
           let out = written name skips variants (compile res) in
           let a = assertTrue (S.contains "@pub fun lexToken input" out) "a function named for the type" in
-          let b = assertTrue (S.contains "def tokenTable = Dfa" out and S.contains "readInts" out) "a table" in
+          let b = assertTrue (S.contains "fun scytheTokenS0 " out and S.contains "packBytes" out) "a function per state, and a packed table" in
           let c = assertTrue (S.contains "Token.Plus" out) "a constructor with no text" in
-          assertTrue (S.contains "(Token.Number text)" out) "and one with it"
+          assertTrue (S.contains "(Token.Number (stringSlice input at upto))" out) "and one with it"
+
+-- Nine patterns that each stay put on their own letter: nine looping states,
+-- so the ninth's bit is in a second table, 256 bytes along.
+@test fun moreLoopsThanOneTableHoldsSpillIntoTheNext () =
+  let letters = V.range 97 106 in
+  let d = compile (V.map (\b -> (b - 97, Star (Lit b))) letters) in
+  let out = written "L" [] [] d in
+  let a = assertTrue (S.contains "stringByteAt l (0 + b)" out) "the first table" in
+  assertTrue (S.contains "stringByteAt l (256 + b)" out) "and the second"
+
+-- 127 bytes told apart make 128 classes, which do not fit a byte of a string
+-- below 128: the class table is written as numbers instead.
+@test fun tooManyClassesForAByteAreKeptAsNumbers () =
+  let d = compile (V.map (\b -> (b - 1, Lit b)) (V.range 1 128)) in
+  let out = written "W" [] [] d in
+  let a = assertTrue (S.contains "def scytheWClasses = readInts" out) "read as numbers" in
+  assertTrue (S.contains "arrayGet c b" out) "and looked up in an array"
+
+@test fun aFewClassesArePackedIntoAString () =
+  let d = compile [(0, Lit 97), (1, Lit 98)] in
+  let out = written "P" [] [] d in
+  let a = assertTrue (S.contains "def scythePClasses = packBytes" out) "packed" in
+  assertTrue (S.contains "toInt (stringByteAt c b)" out) "and read a byte at a time"

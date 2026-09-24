@@ -30,115 +30,135 @@ shape Meadow's macros make possible.
 `@derive(Lexer)` reads the patterns off the variants and builds a deterministic
 finite automaton **while your package is compiled** — the patterns are parsed,
 turned into a nondeterministic machine, made deterministic by the subset
-construction, then pruned and minimised, all inside the compiler. What is left
-for run time is a table walk: no regex engine, no backtracking, one pass over
-the bytes.
+construction, then pruned and minimised, all inside the compiler. Then it
+writes the machine out as code, as logos does: a function per state, each
+reading one byte and jumping to the next. No regex engine, no backtracking,
+no table to consult, one pass over the bytes.
 
 Two rules decide what a token is, and they are logos's:
 
-* the **longest** match wins, so `letter` is an identifier rather than `let`
+- the **longest** match wins, so `letter` is an identifier rather than `let`
   followed by `ter`;
-* where two patterns match the same text, the one **declared first** wins,
+- where two patterns match the same text, the one **declared first** wins,
   which is what lets a keyword beat an identifier.
-
-## Writing the declaration
-
-| written | means |
-|---|---|
-| `@token("+")` | that text, exactly; its meta-characters are not special |
-| `@regex("[0-9]+")` | a pattern |
-| `@skip("[ \t]+")` | above the declaration: matched and thrown away |
-| `Ident String` | a variant with a `String` field is given the text that matched |
-
-The patterns are bytes, not characters: `[a-z]` is a range of bytes, and `.` is
-any byte but a newline. What is supported is what a token looks like —
-literals, classes (`[a-z0-9_]`, `[^ ]`), `\d` `\w` `\s` and their negations,
-`*` `+` `?`, alternation, grouping. There are no captures, no backreferences
-and no anchors: a lexer matches from where it stands and takes the longest
-match, so there would be nothing for them to mean.
-
-A pattern that is not a pattern is reported where you wrote it, at compile
-time, and so is a variant that says nothing about what it matches.
 
 ## What you get
 
 ```meadow
 @pub fun lexToken : String -> Result Error [Lexed Token]
+@pub fun foldToken : (acc -> Token -> Int -> Int -> acc) -> acc -> String -> Result Error acc
 ```
 
-* `token l`, `start l`, `stop l` — the token and the bytes it covers.
-* `errorAt e` — where a scan stopped, when nothing matched.
+- `lexToken` — every token, with where it was.
+- `foldToken f acc input` — the tokens one at a time, into
+  `f acc token start stop`, keeping none of them. This is logos's `Lexer`, an
+  iterator, and it is the one to reach for when nothing needs every token at
+  once: it skips building the vector, which is most of what `lexToken` costs.
+- `token l`, `start l`, `stop l` — the token and the bytes it covers.
+- `errorAt e` — where a scan stopped, when nothing matched.
 
 ## Using the machinery directly
 
 The pieces are exported, so a lexer can be built without the derive:
 `parse` reads a pattern, `compile` turns a numbered list of them into a `Dfa`,
-and `scan` walks an input with one.
+and `scan` (or `foldScan`) walks an input with one. That scanner walks the
+tables rather than code written for them, so it is the slower road.
 
 ## What it does to the machine before it writes it down
 
 The subset construction answers a machine that is correct, not one that is
-small or quick. logos puts four passes between that machine and the code it
-emits, and all four are here — in `src/Automaton.mw`, which says at the top
-which is which:
+small or quick. logos puts passes between that machine and the code it emits,
+and these are here, in `src/Automaton.mw`, which says at the top which is
+which:
 
-* **dead ends are pruned.** A state that cannot reach an accepting state can
+- **dead ends are pruned.** A state that cannot reach an accepting state can
   only ever end in a backtrack, so the graph is walked backwards from the
   accepting states and everything it does not reach is thrown away. A scan that
   would have read to the end of a word before giving up now stops at the byte
   that made it hopeless.
-* **equivalent states are merged, to a fixed point.** Two states that accept the
+- **equivalent states are merged, to a fixed point.** Two states that accept the
   same token and move the same way are one state. Merging a pair can leave two
   more identical, so the pass repeats until the count stops falling.
-* **the alphabet is cut to byte classes.** Two bytes no pattern tells apart cost
+- **the alphabet is cut to byte classes.** Two bytes no pattern tells apart cost
   one column between them rather than two — logos's `ByteClass`, seen from the
   table's side. Columns that every state treats alike are merged as well.
-* **dispatch is a lookup, not a search.** logos emits `TABLE[byte as usize]` for
-  any state with more than two edges. The same idea laid out flat here:
-  `trans[state * classes + classOf[byte]]`, two indexed reads and no comparison
-  chain.
 
-Two more are the scanner's rather than the automaton's. The input is taken
-apart once, into an array — logos scans a `&[u8]`, and a persistent vector
-would put a tree walk under every byte. And a token's text is cut only when
-something wants it, which is logos's `Lexer::slice`: a skipped token —
-whitespace, a comment — now costs nothing but the bytes it steps over.
+All of it runs inside the compiler, under the step budget Meadow gives a macro,
+so it is written to do each piece of work once. Every state's closure over
+empty edges, the letter each byte falls in, and what each state accepts are
+worked out before the subset construction starts, not inside it. Each state of
+the machine is then made in one pass over its edges, where the first version
+asked every letter about every edge. The table is filled edge by edge rather
+than cell by cell. A 16-pattern grammar with strings, comments, hex and floats
+used to run out of budget, and now builds in less than half the time (24 ms to
+11 ms, measured natively).
 
-There is one place this parts company with logos. logos writes a full 256-entry
-table per state, which costs a Rust `const` nothing. Meadow gives every element
-of an array literal its own register while the block that builds it runs, and
-the allocator does not spill, so a literal of a few hundred numbers is refused
-outright. A derive here writes its table as *text* and reads it back once, on
-the first look at the `def` that holds it — a `def` is evaluated once and
-remembered, so nothing per byte of input ever touches it.
+## How it writes the machine down
+
+What `src/Gen.mw` writes is logos's shape:
+
+- **a function per state.** Moving from one state to the next is a call in
+  tail position, which compiles to a jump. The machine is the program's control
+  flow, not data the program reads.
+- **a jump table per state.** A state picks where to go by the byte's class,
+  with a chain of tests on one `Int` that LLVM turns into a `switch`, and a
+  dense `switch` into a jump table. Classes that lead to the same state share
+  an arm.
+- **lookup tables, packed.** A byte's class is one byte of a 256-byte string,
+  read with `stringByteAt`, which is one load. A state with an edge back to
+  itself — an identifier, a number, a run of spaces — gets one _bit_ of a
+  second table, which says of each byte whether the state stays put on it.
+  That is logos's fast loop, and its trick of packing several such tables into
+  the bits of one: seven to a byte here, because a string is UTF-8 and a lone
+  byte above 127 would not survive.
+- **one word per match.** A state answers where the longest match ended and
+  which token it was as one `Int`, so nothing is allocated until a token is.
+- **the input is read where it is.** A Meadow string is bytes already, so it is
+  never copied into an array; the text of a token is cut from it only for a
+  token that is kept and carries its text, which is logos's `Lexer::slice`.
+
+Everything written is a top-level function with its numbers annotated `Int`.
+Both matter more than they look. A loop written as a local `let rec` is a
+closure, which calls itself through its object on every byte; a top-level
+function calling itself is a jump. And a number nothing pins down is passed as
+any `Num`, with its arithmetic looked up in a dictionary.
 
 ## How fast
 
 `bench/run.sh` lexes the same 48 KB of calculator source with this library and
-with the Rust crate, the same way both times — best of a few runs, since the
+with the Rust crate, the same way both times — best of several runs, since the
 work is deterministic and the spread is the machine's doing. Both agree the
-file holds 10,270 tokens, which is what makes the columns worth comparing.
-Meadow is built `--release` (`-O2`, compiled ahead of time) against Rust's
-`--release`. On one laptop:
+file holds 10,270 tokens, which is what makes the rows worth comparing. Meadow
+is built with `--release --runtime aot` (LLVM, `-O2`) against Rust's
+`--release`. On one Windows laptop:
 
-| lexer | best | throughput |
-|---|---|---|
-| meadow, before the passes above | 326 ms | 0.1 MB/s |
-| meadow, after | 50 ms | 1.0 MB/s |
-| meadow, after, token kinds only | 50 ms | 1.0 MB/s |
-| rust logos | 91 µs | 523 MB/s |
-| rust logos, borrowing each token's text | 98 µs | 487 MB/s |
-| rust logos, building an owned `String` per token | 214 µs | 224 MB/s |
+| lexer                                            | best   | throughput |
+| ------------------------------------------------ | ------ | ---------- |
+| meadow, the first engine (`before` in the bench) | 173 ms | 0.3 MB/s   |
+| meadow, the table walk this replaced             | 164 ms | 0.3 MB/s   |
+| meadow, `lexToken`                               | 2.8 ms | 18 MB/s    |
+| meadow, `lexKind` (no token carries text)        | 2.4 ms | 20 MB/s    |
+| meadow, `foldToken`                              | 1.0 ms | 48 MB/s    |
+| meadow, `foldKind`                               | 794 µs | 62 MB/s    |
+| rust logos                                       | 76 µs  | 645 MB/s   |
+| rust logos, borrowing each token's text          | 79 µs  | 618 MB/s   |
+| rust logos, building an owned `String` per token | 175 µs | 282 MB/s   |
 
-So the passes are worth about **6.5×**, and what is left is **236×** slower
-than logos doing the same work — the last row is the like-for-like one, because
-a Meadow token that carries its text carries a `String` it owns.
+So the code generation is worth about **200×** over the table walk. What is
+left is about **10×** behind logos doing the same work (`foldKind` against
+`logos`), and about **6×** behind it on the like-for-like row with text
+(`foldToken` against the owned `String`, since a Meadow token that carries its
+text carries a string of its own).
 
-The remaining distance is the runtime, not the algorithm: both walk one table,
-one byte at a time, and Meadow charges around 50 ns for an array read where a
-compiled Rust program charges a load. The passes above are what stopped the
-lexer paying that charge more often than it had to — a persistent vector read,
-which the engine before them used for every byte of input, costs 2.8 µs.
+The rest of the distance is the compiler's, not the lexer's. A call that is
+not in tail position costs about 10 ns in native Meadow code, and a scan makes
+three of them for each token. Collecting the tokens costs about 230 ns more
+each, which is persistent-vector `pushBack`, and that is why the `fold` rows
+are more than twice as fast as the `lex` rows.
+
+On the default runtime (`meadow run --release`, no `--runtime aot`) the same
+machine takes 4.1 ms for `lexToken` and 2.0 ms for `foldKind`, where the table
+walk took 20 ms.
 
 ## Example
 
