@@ -7,11 +7,14 @@
 use Scythe (lexer!, token, start, stop, errorAt)
 use Std.Collections.Vector as V
 
+-- Whitespace and comments are matched like any token; `@skip` leaves them out
+-- of what is lexed. Without it they are tokens too, which is what a lossless
+-- syntax tree is built from.
 @derive(Lexer)
-@skip("[ \t\r\n]+")
-@skip("--[^\n]*")
 data Token
-  = @token("+") Plus
+  = @regex("[ \t\r\n]+") @skip Whitespace
+  | @regex("--[^\n]*") @skip Comment
+  | @token("+") Plus
   | @token("-") Minus
   | @token("*") Star
   | @token("/") Slash

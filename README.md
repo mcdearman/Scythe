@@ -6,9 +6,9 @@ A lexer written for you, from the tokens you declare.
 use Scythe (lexer!, token)
 
 @derive(Lexer)
-@skip("[ \t\r\n]+")
 data Token
-  = @token("+") Plus
+  = @regex("[ \t\r\n]+") @skip Whitespace
+  | @token("+") Plus
   | @token("let") Let
   | @regex("[0-9]+") Number String
   | @regex("[a-zA-Z_][a-zA-Z0-9_]*") Ident String
@@ -21,6 +21,12 @@ declaration:
 lexToken "let x 1 + 23"
 -- Ok [Let, Ident("x"), Number("1"), Plus, Number("23")]
 ```
+
+A variant marked `@skip` is matched like any other and left out of what is
+lexed. Leave the `@skip` off and it is a token too — `Whitespace` between every
+pair above — which is what a lossless syntax tree is built from. (A pattern
+with no variant of its own can also be skipped from the type,
+`@skip("--[^\n]*")`.)
 
 A port of the Rust crate [logos](https://github.com/maciejhirsz/logos), in the
 shape Meadow's macros make possible.

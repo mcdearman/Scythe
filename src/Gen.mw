@@ -22,6 +22,7 @@
 use Std.Macro (TokenTree, spaced, text, isPunct, isWord, inside, splitOn, fail)
 use Std.Macro.TokenTree.*
 use Std.Macro.Delim.*
+use Std.Macro.Loc.*
 use Std.Collections.Vector as V
 use Std.String as S
 use Std.Maybe.Maybe.*
@@ -54,7 +55,7 @@ fun declaration ts =
 
 fun dropUntilData ts = V.dropWhile (\t -> not (isWord "data" t)) ts
 
-fun word t = match t with | Word w -> Just w | _ -> None
+fun word t = match t with | Word w _ -> Just w | _ -> None
 
 -- `@skip("…")` written above the declaration, in the order they appear.
 fun skipsOf ts =
@@ -65,8 +66,8 @@ fun skipsOf ts =
 fun attributeArgs ts name =
   V.foldl
     (\acc i ->
-      if isWord name (V.getOr (Punct "") ts i) and isPunct "@" (V.getOr (Punct "") ts (i - 1)) then
-        match literalIn (V.getOr (Punct "") ts (i + 1)) with
+      if isWord name (V.getOr (Punct "" Nowhere) ts i) and isPunct "@" (V.getOr (Punct "" Nowhere) ts (i - 1)) then
+        match literalIn (V.getOr (Punct "" Nowhere) ts (i + 1)) with
         | Just s -> V.pushBack acc s
         | None -> acc
       else acc)
@@ -79,7 +80,7 @@ fun literalIn t =
   | None -> None
   | Just ts ->
       match V.toList ts with
-      | Cons (Str s) Nil -> Just s
+      | Cons (Str s _) Nil -> Just s
       | _ -> None
 
 -- --- the patterns, in the order the machine numbers them ----------------------
@@ -113,6 +114,25 @@ fun collectSkips skips base sofar =
               | Ok re -> Ok (V.pushBack res (base + i, re)))
     (Ok sofar)
     (V.zip (V.range 0 (V.len skips)) skips)
+
+-- The variants written `@skip`, by number: matched like any other -- so they
+-- compete for the longest match in the order they are declared -- and then
+-- left out of what is lexed. A variant without it is a token, whitespace
+-- included: what a lossless tree is built from.
+fun skippedIds variants =
+  V.filter (\i -> bareSkip (V.getOr [] variants i)) (V.range 0 (V.len variants))
+
+-- Whether `v` says `@skip` with nothing after it -- the variant-level marker,
+-- not the type-level `@skip("…")`, which is a pattern of its own.
+fun bareSkip v =
+  V.any
+    (\i ->
+      isWord "skip" (V.getOr (Punct "" Nowhere) v i)
+        and isPunct "@" (V.getOr (Punct "" Nowhere) v (i - 1))
+        and not (isGroup (V.getOr (Punct "" Nowhere) v (i + 1))))
+    (V.range 1 (V.len v))
+
+fun isGroup t = match inside t with | Just _ -> True | None -> False
 
 -- A variant's pattern: `@token("…")` is text to match exactly, `@regex("…")`
 -- is a pattern.
@@ -166,6 +186,7 @@ def metaBytes = [40, 41, 91, 93, 123, 125, 46, 42, 43, 63, 124, 94, 36, 92, 45]
 
 fun written name skips variants d =
   let t = "scythe${name}" in
+  let dropped = skippedIds variants in
   let wide = dfaClasses d in
   let slots = loopSlots d in
   let packed = wide < 128 in
@@ -180,6 +201,10 @@ def ${t}Loops = packBytes \"${showIntArray (loopTable d slots)}\"
 
 -- ${show (dfaStates d)} states, ${show wide} classes.
 ${S.join "\n" (V.map (\s -> stateFun t d slots packed s) (V.range 0 (dfaStates d)))}
+-- Whether a match of this number is one to leave out: a variant written
+-- `@skip`, or one of the type's own skipped patterns.
+fun ${t}Skipped (id : Int) : Bool = id >= ${show (V.len variants)}${S.join "" (V.map (\i -> " or id == ${show i}") dropped)}
+
 -- A token from its number and where it was.
 fun ${t}Make (id : Int) (input : String) (at : Int) (upto : Int) =
   ${arms name variants (V.range 0 (V.len variants))}
@@ -191,7 +216,7 @@ fun ${t}Go ${tables packed} (input : String) (n : Int) (at : Int) sofar =
     let id = r % 65536 - 1 in
     let upto = r / 65536 in
     if id < 0 or upto <= at then stuckAt at
-    else if id >= ${show (V.len variants)} then ${t}Go c l input n upto sofar
+    else if ${t}Skipped id then ${t}Go c l input n upto sofar
     else ${t}Go c l input n upto (pushToken sofar (${t}Make id input at upto) at upto)
 
 fun ${t}Fold f ${tables packed} (input : String) (n : Int) (at : Int) acc =
@@ -201,7 +226,7 @@ fun ${t}Fold f ${tables packed} (input : String) (n : Int) (at : Int) acc =
     let id = r % 65536 - 1 in
     let upto = r / 65536 in
     if id < 0 or upto <= at then stuckAt at
-    else if id >= ${show (V.len variants)} then ${t}Fold f c l input n upto acc
+    else if ${t}Skipped id then ${t}Fold f c l input n upto acc
     else ${t}Fold f c l input n upto (f acc (${t}Make id input at upto) at upto)
 
 -- Every token in `input`, or where it stopped making sense.
@@ -332,14 +357,14 @@ fun ctorOf v =
 
 fun isCtorStart v t =
   match t with
-  | Word w -> isUpper w and not (V.elem w (attributeNames v))
+  | Word w _ -> isUpper w and not (V.elem w (attributeNames v))
   | _ -> False
 
 fun attributeNames v =
   V.foldl
     (\acc i ->
-      if isPunct "@" (V.getOr (Punct "") v i) then
-        match word (V.getOr (Punct "") v (i + 1)) with
+      if isPunct "@" (V.getOr (Punct "" Nowhere) v i) then
+        match word (V.getOr (Punct "" Nowhere) v (i + 1)) with
         | Just w -> V.pushBack acc w
         | None -> acc
       else acc)
@@ -377,12 +402,12 @@ use Scythe.Regex.Re.*
 
 -- The declaration above, as the tokens a derive is given.
 fun declared () =
-  [Punct "@", Word "derive", Group Paren [Word "Lexer"],
-    Punct "@", Word "skip", Group Paren [Str " +"],
-    Word "data", Word "Token", Punct "=",
-    Punct "@", Word "token", Group Paren [Str "+"], Word "Plus",
-    Punct "|",
-    Punct "@", Word "regex", Group Paren [Str "[0-9]+"], Word "Number", Word "String"]
+  [Punct "@" Nowhere, Word "derive" Nowhere, Group Paren [Word "Lexer" Nowhere] Nowhere,
+    Punct "@" Nowhere, Word "skip" Nowhere, Group Paren [Str " +" Nowhere] Nowhere,
+    Word "data" Nowhere, Word "Token" Nowhere, Punct "=" Nowhere,
+    Punct "@" Nowhere, Word "token" Nowhere, Group Paren [Str "+" Nowhere] Nowhere, Word "Plus" Nowhere,
+    Punct "|" Nowhere,
+    Punct "@" Nowhere, Word "regex" Nowhere, Group Paren [Str "[0-9]+" Nowhere] Nowhere, Word "Number" Nowhere, Word "String" Nowhere]
 
 @test fun aDeclarationIsReadForItsNameAndVariants () =
   match declaration (declared ()) with
@@ -408,12 +433,12 @@ fun declared () =
   assertEq (quoted "a+b") "a\\+b" "the meta characters are escaped"
 
 @test fun aVariantWithNoPatternIsRefused () =
-  match patternOf [Word "Plus"] with
+  match patternOf [Word "Plus" Nowhere] with
   | Err why -> assertTrue (S.contains "says nothing about what it matches" why) why
   | Ok _ -> assertTrue False "it should have been refused"
 
 @test fun aPatternThatIsNotOneIsRefused () =
-  match patternOf [Punct "@", Word "regex", Group Paren [Str "[a"], Word "Bad"] with
+  match patternOf [Punct "@" Nowhere, Word "regex" Nowhere, Group Paren [Str "[a" Nowhere] Nowhere, Word "Bad" Nowhere] with
   | Err why -> assertTrue (S.contains "not a pattern" why) why
   | Ok _ -> assertTrue False "it should have been refused"
 
@@ -452,3 +477,11 @@ fun declared () =
   let out = written "P" [] [] d in
   let a = assertTrue (S.contains "def scythePClasses = packBytes" out) "packed" in
   assertTrue (S.contains "toInt (stringByteAt c b)" out) "and read a byte at a time"
+
+@test fun aVariantWrittenSkipIsMatchedAndLeftOut () =
+  let space = [Punct "@" Nowhere, Word "regex" Nowhere, Group Paren [Str "[ ]+" Nowhere] Nowhere, Punct "@" Nowhere, Word "skip" Nowhere, Word "Space" Nowhere] in
+  let plus = [Punct "@" Nowhere, Word "token" Nowhere, Group Paren [Str "+" Nowhere] Nowhere, Word "Plus" Nowhere] in
+  let kept = [Punct "@" Nowhere, Word "regex" Nowhere, Group Paren [Str "[ ]+" Nowhere] Nowhere, Word "Space" Nowhere] in
+  let a = assertEq (skippedIds [space, plus]) [0] "the one written `@skip`" in
+  let b = assertEq (skippedIds [kept, plus]) [] "whitespace without it is a token" in
+  assertEq (ctorOf space) "Space" "`skip` is not taken for the constructor"
