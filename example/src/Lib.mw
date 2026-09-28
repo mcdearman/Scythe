@@ -46,3 +46,11 @@ use Std.Test (assertEq)
   assertEq (M.map token (unwrap (nextToken input 23))) None "nothing at the end"
 
 fun unwrap r = match r with | Ok x -> x | Err _ -> None
+
+-- `reachToken` is how far the machine reads: the longest match, or where it
+-- gave up when nothing matches, as logos spans the error it makes.
+@test fun theMachineReachesTheEndOfTheLongestMatch () =
+  let a = assertEq (reachToken "letter = 1" 0) 6 "a name, not `let`" in
+  let b = assertEq (reachToken "2.5x" 0) 3 "a number with its fraction" in
+  let c = assertEq (reachToken "2.x" 0) 1 "the fraction it could not finish is given back" in
+  assertEq (reachToken "?" 0) 0 "nothing at all"

@@ -54,6 +54,7 @@ Two rules decide what a token is, and they are logos's:
 @pub fun lexToken : String -> Result Error [Lexed Token]
 @pub fun foldToken : (acc -> Token -> Int -> Int -> acc) -> acc -> String -> Result Error acc
 @pub fun nextToken : String -> Int -> Result Error (Maybe (Lexed Token))
+@pub fun reachToken : String -> Int -> Int
 ```
 
 - `lexToken` — every token, with where it was.
@@ -66,6 +67,9 @@ Two rules decide what a token is, and they are logos's:
   made of that reads part of a text with one set of tokens and part with
   another, as logos's `morph` does -- the text inside a string literal, say,
   and the code in its `${…}` holes.
+- `reachToken input at` — how far the machine reads from `at`: to the end of
+  the longest match, or, where nothing matches, to where it stopped. That is
+  the span logos gives the error it makes there -- `'ab'` stops after `'a`.
 - `token l`, `start l`, `stop l` — the token and the bytes it covers.
 - `errorAt e` — where a scan stopped, when nothing matched.
 

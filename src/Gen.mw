@@ -254,6 +254,12 @@ fun ${t}Next ${tables packed} (input : String) (n : Int) (at : Int) =
 -- and `morph`. `Ok None` at the end of the input.
 @pub fun next${name} input (at : Int) =
   ${t}Next ${t}Classes ${t}Loops input (stringByteLength input) at
+
+-- How far the machine reads from byte `at`: to the end of the longest match,
+-- or, where nothing matches, to where it stopped -- the span logos gives the
+-- error it makes there. `at` itself when it reads nothing.
+@pub fun reach${name} input (at : Int) : Int =
+  ${t}S0 ${t}Classes ${t}Loops input (stringByteLength input) at 0 / 65536
 "
 
 -- The tables every generated function takes, annotated: the class table is a
@@ -309,7 +315,10 @@ fun stateFun t d slots packed s =
   let accept = arrayGet (dfaAccepts d) s in
   let slot = V.getOr (0 - 1) slots s in
   let me = "${t}S${show s}" in
-  let noted = if accept >= 0 then "i * 65536 + ${show (accept + 1)}" else "best" in
+  -- A state that does not accept notes where it is, while nothing has matched
+  -- yet: where the machine stops, when nothing does, is where logos ends the
+  -- error it makes (see `reach…`).
+  let noted = if accept >= 0 then "i * 65536 + ${show (accept + 1)}" else "if best % 65536 == 0 then i * 65536 else best" in
   let loop =
     if slot < 0 then ""
     else
