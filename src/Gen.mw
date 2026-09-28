@@ -191,7 +191,7 @@ fun written name skips variants d =
   let slots = loopSlots d in
   let packed = wide < 128 in
   let classes = if packed then "packBytes" else "readInts" in
-  "use Scythe (packBytes, readInts, noTokens, pushToken, scanned, stuckAt)
+  "use Scythe (packBytes, readInts, noTokens, pushToken, scanned, stuckAt, found, ended)
 
 -- A byte's class: bytes no pattern tells apart share one.
 def ${t}Classes = ${classes} \"${showArray (dfaClassOf d)}\"
@@ -229,6 +229,16 @@ fun ${t}Fold f ${tables packed} (input : String) (n : Int) (at : Int) acc =
     else if ${t}Skipped id then ${t}Fold f c l input n upto acc
     else ${t}Fold f c l input n upto (f acc (${t}Make id input at upto) at upto)
 
+fun ${t}Next ${tables packed} (input : String) (n : Int) (at : Int) =
+  if at >= n then ended ()
+  else
+    let r = ${t}S0 c l input n at 0 in
+    let id = r % 65536 - 1 in
+    let upto = r / 65536 in
+    if id < 0 or upto <= at then stuckAt at
+    else if ${t}Skipped id then ${t}Next c l input n upto
+    else found (${t}Make id input at upto) at upto
+
 -- Every token in `input`, or where it stopped making sense.
 @pub fun lex${name} input =
   ${t}Go ${t}Classes ${t}Loops input (stringByteLength input) 0 noTokens
@@ -237,6 +247,13 @@ fun ${t}Fold f ${tables packed} (input : String) (n : Int) (at : Int) acc =
 -- them: logos's `Lexer`, which is an iterator rather than a list.
 @pub fun fold${name} f acc input =
   ${t}Fold f ${t}Classes ${t}Loops input (stringByteLength input) 0 acc
+
+-- The token at byte `at` of `input`, past any skipped: logos's `Lexer::next`,
+-- from wherever the caller says. What a lexer reading one part of a text with
+-- these tokens and another part with other ones is made of -- logos's `bump`
+-- and `morph`. `Ok None` at the end of the input.
+@pub fun next${name} input (at : Int) =
+  ${t}Next ${t}Classes ${t}Loops input (stringByteLength input) at
 "
 
 -- The tables every generated function takes, annotated: the class table is a

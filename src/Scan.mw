@@ -95,6 +95,12 @@ fun skipped skip (id : Int) (i : Int) : Bool =
 
 @pub fun stuckAt (at : Int) = Err (Unexpected at)
 
+-- What `next…` answers: the token found, and where; or that there is none
+-- left.
+@pub fun found t (at : Int) (upto : Int) = Ok (Just (Lexed t at upto))
+
+@pub fun ended () = Ok None
+
 -- --- tests -------------------------------------------------------------------
 
 use Std.Test (assertEq, assertTrue)

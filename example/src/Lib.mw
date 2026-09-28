@@ -6,6 +6,7 @@
 
 use Scythe (lexer!, token, start, stop, errorAt)
 use Std.Collections.Vector as V
+use Std.Maybe as M
 
 -- Whitespace and comments are matched like any token; `@skip` leaves them out
 -- of what is lexed. Without it they are tokens too, which is what a lossless
@@ -30,3 +31,18 @@ def main =
   match lexToken input with
   | Ok ts -> println (show (V.map token ts))
   | Err e -> println "stopped at byte ${show (errorAt e)}"
+
+-- --- tests -------------------------------------------------------------------
+
+use Std.Test (assertEq)
+
+-- `nextToken` reads one token from wherever it is asked to, past any skipped,
+-- as logos's `Lexer` does after a `bump`.
+@test fun theNextTokenIsReadFromAnyOffset () =
+  let input = "let x = 4 -- four\n  + y" in
+  let a = assertEq (M.map token (unwrap (nextToken input 0))) (Just Token.Let) "the first" in
+  let b = assertEq (M.map (\l -> (token l, start l, stop l)) (unwrap (nextToken input 8))) (Just (Token.Number "4", 8, 9)) "from the middle" in
+  let c = assertEq (M.map token (unwrap (nextToken input 9))) (Just Token.Plus) "past a comment and a line" in
+  assertEq (M.map token (unwrap (nextToken input 23))) None "nothing at the end"
+
+fun unwrap r = match r with | Ok x -> x | Err _ -> None

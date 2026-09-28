@@ -14,6 +14,6 @@ mod Gen
 )
 @pub use Scythe.Scan (
   Lexed, Error, scan, foldScan, token, start, stop, errorAt,
-  noTokens, pushToken, scanned, stuckAt,
+  noTokens, pushToken, scanned, stuckAt, found, ended,
 )
 @pub use Scythe.Gen (lexer)

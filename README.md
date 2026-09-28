@@ -53,6 +53,7 @@ Two rules decide what a token is, and they are logos's:
 ```meadow
 @pub fun lexToken : String -> Result Error [Lexed Token]
 @pub fun foldToken : (acc -> Token -> Int -> Int -> acc) -> acc -> String -> Result Error acc
+@pub fun nextToken : String -> Int -> Result Error (Maybe (Lexed Token))
 ```
 
 - `lexToken` — every token, with where it was.
@@ -60,6 +61,11 @@ Two rules decide what a token is, and they are logos's:
   `f acc token start stop`, keeping none of them. This is logos's `Lexer`, an
   iterator, and it is the one to reach for when nothing needs every token at
   once: it skips building the vector, which is most of what `lexToken` costs.
+- `nextToken input at` — the one token at byte `at`, past anything skipped,
+  or `None` at the end. logos's `Lexer::next` after a `bump`: what a lexer is
+  made of that reads part of a text with one set of tokens and part with
+  another, as logos's `morph` does -- the text inside a string literal, say,
+  and the code in its `${…}` holes.
 - `token l`, `start l`, `stop l` — the token and the bytes it covers.
 - `errorAt e` — where a scan stopped, when nothing matched.
 
