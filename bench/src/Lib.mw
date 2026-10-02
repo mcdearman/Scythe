@@ -122,7 +122,7 @@ fun pad n s = if S.byteLength s >= n then s ++ "  " else pad n (s ++ " ")
 
 fun run name bytes reps act = report name bytes (bestOf reps act)
 
-def main =
+fun main () =
   let text = corpus () in
   let bytes = S.byteLength text in
   if bytes == 0 then
